@@ -27,7 +27,7 @@ import (
 )
 
 func init() {
-	caddy.RegisterModule(DDOSMitigator{})
+	caddy.RegisterModule(new(DDOSMitigator))
 	httpcaddyfile.RegisterHandlerDirective("ddos_mitigator", parseCaddyfileDDOSMitigator)
 }
 
@@ -103,6 +103,11 @@ type DDOSMitigator struct {
 	// startup and low-traffic periods. Default: 1000.
 	WarmupRequests int `json:"warmup_requests,omitempty"`
 
+	// PathDepth is the maximum number of path segments used for fingerprinting.
+	// If > 0, paths are truncated: /a/b/c/d with depth=2 → /a/b.
+	// Default: 0 (no truncation — backward compatible).
+	PathDepth int `json:"path_depth,omitempty"`
+
 	// --- Internal state ---
 
 	jail      *ipJail
@@ -120,7 +125,7 @@ type DDOSMitigator struct {
 
 // ─── Caddy Module Interface ─────────────────────────────────────────
 
-func (DDOSMitigator) CaddyModule() caddy.ModuleInfo {
+func (*DDOSMitigator) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.handlers.ddos_mitigator",
 		New: func() caddy.Module { return new(DDOSMitigator) },
@@ -318,6 +323,9 @@ func (m *DDOSMitigator) Validate() error {
 	if m.WarmupRequests < 0 {
 		return fmt.Errorf("warmup_requests must be non-negative, got %d", m.WarmupRequests)
 	}
+	if m.PathDepth < 0 {
+		return fmt.Errorf("path_depth must be non-negative, got %d", m.PathDepth)
+	}
 	return nil
 }
 
@@ -372,9 +380,9 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	}
 
 	// 3. Record behavioral profile + update CMS for EPS tracking
-	m.tracker.Record(addr, r.Method, r.URL.Path, r.UserAgent(), 0) // status filled by response
+	m.tracker.Record(addr, r.Method, r.URL.Path, r.UserAgent())
 	strat := fingerprintStrategy(m.strategy.Load())
-	fp := computeFingerprint(strat, addr, r.Method, r.URL.Path, r.UserAgent())
+	fp := computeFingerprint(strat, addr, r.Method, r.URL.Path, r.UserAgent(), m.PathDepth)
 	m.cms.Increment(fp[:])
 	m.stats.Observe(1.0) // observation count for EWMA/spike detection
 
@@ -384,6 +392,7 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	if score > m.Threshold {
 		ttl := m.calcTTL(addr)
 		m.jail.Add(addr, ttl, "auto:behavioral", m.infractionCount(addr))
+		m.cidr.IncrementPrefix(addr)
 		m.setVars(r, "jailed", addr, score, fpHex(fp))
 		m.logger.Info("auto-jailed IP (behavioral)",
 			zap.String("ip", addr.String()),
@@ -393,7 +402,7 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			zap.String("fingerprint", fpHex(fp)))
 
 		// Check CIDR aggregation — promote /24 or /64 if enough IPs from same subnet
-		if prefix := m.cidr.Check(m.jail, addr, ttl); prefix != nil {
+		if prefix := m.cidr.Check(addr, ttl); prefix != nil {
 			m.logger.Warn("CIDR prefix promoted",
 				zap.String("prefix", prefix.String()),
 				zap.Duration("ttl", ttl))
@@ -486,7 +495,9 @@ func (m *DDOSMitigator) runSweeper(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			n := m.jail.Sweep()
+			n := m.jail.SweepWithCallback(func(addr netip.Addr) {
+				m.cidr.DecrementPrefix(addr)
+			})
 			if n > 0 {
 				m.logger.Debug("jail sweep", zap.Int("removed", n),
 					zap.Int64("remaining", m.jail.Count()))
@@ -516,32 +527,37 @@ func (m *DDOSMitigator) runFileSync(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Snapshot current jail before reading file
-			beforeSync := m.jail.Snapshot()
+			if err := withFileLock(m.JailFile, func() error {
+				// Snapshot current jail before reading file
+				beforeSync := m.jail.Snapshot()
 
-			// Read new entries from file (written by wafctl)
-			if err := readJailFile(m.JailFile, m.jail); err != nil {
-				m.logger.Warn("jail file read error", zap.Error(err))
-			}
-
-			// Check for IPs that were manually unjailed via wafctl API:
-			// if an IP was in the jail before sync but is no longer jailed,
-			// clear its behavioral profile so it won't be immediately re-jailed.
-			for addr := range beforeSync {
-				if !m.jail.IsJailed(addr) {
-					m.tracker.Reset(addr)
-					m.logger.Info("cleared behavioral profile for unjailed IP",
-						zap.String("ip", addr.String()))
+				// Read new entries from file (written by wafctl)
+				if err := readJailFile(m.JailFile, m.jail); err != nil {
+					m.logger.Warn("jail file read error", zap.Error(err))
 				}
-			}
 
-			// Write current jail state to file (for wafctl to read),
-			// but only if the jail has been modified since the last write.
-			if m.jail.dirty.CompareAndSwap(true, false) {
-				if err := writeJailFile(m.JailFile, m.jail); err != nil {
-					m.logger.Warn("jail file write error", zap.Error(err))
-					m.jail.dirty.Store(true) // restore flag on failure
+				// Check for IPs that were manually unjailed via wafctl API:
+				// if an IP was in the jail before sync but is no longer jailed,
+				// clear its behavioral profile so it won't be immediately re-jailed.
+				for addr := range beforeSync {
+					if !m.jail.IsJailed(addr) {
+						m.tracker.Reset(addr)
+						m.logger.Info("cleared behavioral profile for unjailed IP",
+							zap.String("ip", addr.String()))
+					}
 				}
+
+				// Write current jail state to file (for wafctl to read),
+				// but only if the jail has been modified since the last write.
+				if m.jail.dirty.CompareAndSwap(true, false) {
+					if err := writeJailFile(m.JailFile, m.jail); err != nil {
+						m.logger.Warn("jail file write error", zap.Error(err))
+						m.jail.dirty.Store(true) // restore flag on failure
+					}
+				}
+				return nil
+			}); err != nil {
+				m.logger.Warn("jail file sync lock error", zap.Error(err))
 			}
 		}
 	}
@@ -748,6 +764,15 @@ func (m *DDOSMitigator) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Errf("invalid warmup_requests: %v", err)
 			}
 			m.WarmupRequests = v
+		case "path_depth":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			var v int
+			if _, err := fmt.Sscanf(d.Val(), "%d", &v); err != nil {
+				return d.Errf("invalid path_depth: %v", err)
+			}
+			m.PathDepth = v
 		default:
 			return d.Errf("unknown ddos_mitigator directive: %s", d.Val())
 		}

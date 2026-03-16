@@ -18,7 +18,7 @@ func TestIPProfile_NormalBrowsing(t *testing.T) {
 		"/favicon.ico", "/static/app.js", "/static/style.css", "/images/logo.png"}
 
 	for i, p := range paths {
-		tracker.Record(ip, "GET", p, "Mozilla/5.0", 200)
+		tracker.Record(ip, "GET", p, "Mozilla/5.0")
 		_ = i
 	}
 
@@ -43,7 +43,7 @@ func TestIPProfile_FloodAttack(t *testing.T) {
 
 	// Simulate flood: same path, same method, same UA, 500 times
 	for range 500 {
-		tracker.Record(ip, "GET", "/api/vulnerable", "attack-bot/1.0", 200)
+		tracker.Record(ip, "GET", "/api/vulnerable", "attack-bot/1.0")
 	}
 
 	profile := tracker.Profile(ip)
@@ -74,7 +74,7 @@ func TestIPProfile_HighVolumeNormal(t *testing.T) {
 
 	for i := range 200 {
 		p := paths[i%len(paths)]
-		tracker.Record(ip, "GET", p, "Mozilla/5.0 (Windows)", 200)
+		tracker.Record(ip, "GET", p, "Mozilla/5.0 (Windows)")
 	}
 
 	profile := tracker.Profile(ip)
@@ -95,7 +95,7 @@ func TestIPProfile_SlowFlood(t *testing.T) {
 
 	// Simulate slow flood: 50 requests but ALL to the same endpoint
 	for range 50 {
-		tracker.Record(ip, "POST", "/api/login", "curl/8.0", 200)
+		tracker.Record(ip, "POST", "/api/login", "curl/8.0")
 	}
 
 	profile := tracker.Profile(ip)
@@ -119,7 +119,7 @@ func TestIPProfile_CrawlerPattern(t *testing.T) {
 	// Crawler: very diverse paths, single UA, steady rate
 	for i := range 100 {
 		p := fmt.Sprintf("/page/%d", i)
-		tracker.Record(ip, "GET", p, "Googlebot/2.1", 200)
+		tracker.Record(ip, "GET", p, "Googlebot/2.1")
 	}
 
 	profile := tracker.Profile(ip)
@@ -140,7 +140,7 @@ func TestIPProfile_MixedStatusFlood(t *testing.T) {
 
 	// Flood with all 200 responses (normal for legitimate, but suspicious with low diversity)
 	for range 300 {
-		tracker.Record(ip, "GET", "/target", "bot/1.0", 200)
+		tracker.Record(ip, "GET", "/target", "bot/1.0")
 	}
 
 	profile := tracker.Profile(ip)
@@ -156,7 +156,7 @@ func TestIPTracker_Expiry(t *testing.T) {
 	tracker := newIPTracker(100, 50*time.Millisecond)
 
 	ip := netip.MustParseAddr("10.0.0.1")
-	tracker.Record(ip, "GET", "/", "ua", 200)
+	tracker.Record(ip, "GET", "/", "ua")
 
 	if tracker.Profile(ip) == nil {
 		t.Fatal("profile should exist immediately after record")
@@ -171,18 +171,19 @@ func TestIPTracker_Expiry(t *testing.T) {
 }
 
 func TestIPTracker_MaxEntries(t *testing.T) {
-	tracker := newIPTracker(10, 5*time.Minute)
+	// With 64 shards, maxIPs=6400 gives 100 per shard.
+	// Insert 12800 IPs to force evictions.
+	tracker := newIPTracker(6400, 5*time.Minute)
 
-	// Fill beyond capacity
-	for i := range 20 {
-		ip := netip.AddrFrom4([4]byte{10, 0, 0, byte(i)})
-		tracker.Record(ip, "GET", "/", "ua", 200)
+	for i := range 12800 {
+		ip := netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 1})
+		tracker.Record(ip, "GET", "/", "ua")
 	}
 
-	// Should not panic, and count should be bounded
+	// Should not panic, and count should be bounded at maxIPs
 	count := tracker.Count()
-	if count > 15 { // some slack for concurrent adds before eviction
-		t.Fatalf("tracker should be bounded, got %d entries", count)
+	if count > 6400+trackerShards { // small slack per shard
+		t.Fatalf("tracker should be bounded, got %d entries (max 6400)", count)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -27,6 +28,24 @@ func validateJailPath(path string) error {
 		}
 	}
 	return nil
+}
+
+// ─── File Locking ───────────────────────────────────────────────────
+
+// withFileLock acquires an exclusive flock on path+".lock" for the duration
+// of fn. This coordinates jail file access between the plugin and wafctl.
+func withFileLock(path string, fn func() error) error {
+	lockPath := path + ".lock"
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("open lock file: %w", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("acquire file lock: %w", err)
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return fn()
 }
 
 // ─── Whitelist ──────────────────────────────────────────────────────

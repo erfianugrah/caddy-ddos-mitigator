@@ -55,14 +55,15 @@ type nftManager interface {
 // ─── Real Implementation ────────────────────────────────────────────
 
 type nftReal struct {
-	mu     sync.Mutex
-	conn   *nftables.Conn
-	table  *nftables.Table
-	chain  *nftables.Chain
-	setV4  *nftables.Set
-	setV6  *nftables.Set
-	logger *zap.Logger
-	active bool
+	mu                sync.Mutex
+	conn              *nftables.Conn
+	table             *nftables.Table
+	chain             *nftables.Chain
+	setV4             *nftables.Set
+	setV6             *nftables.Set
+	logger            *zap.Logger
+	active            bool
+	consecutiveErrors int
 }
 
 func newNftManager(logger *zap.Logger) nftManager {
@@ -91,7 +92,11 @@ func (n *nftReal) Available() bool {
 func (n *nftReal) Setup() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	return n.setupLocked()
+}
 
+// setupLocked performs the actual nftables setup. Caller must hold n.mu.
+func (n *nftReal) setupLocked() error {
 	if n.conn == nil {
 		return fmt.Errorf("nftables connection not initialized")
 	}
@@ -190,6 +195,7 @@ func (n *nftReal) Setup() error {
 	}
 
 	n.active = true
+	n.consecutiveErrors = 0
 	n.logger.Info("nftables kernel drop enabled",
 		zap.String("table", nftTableName),
 		zap.String("chain", nftChainName))
@@ -204,6 +210,47 @@ func (n *nftReal) SyncJail(entries map[netip.Addr]jailEntry) error {
 		return nil
 	}
 
+	if err := n.syncJailLocked(entries); err != nil {
+		n.consecutiveErrors++
+		n.logger.Warn("nftables sync failed, attempting reconnect",
+			zap.Error(err),
+			zap.Int("consecutive_errors", n.consecutiveErrors))
+
+		// Attempt to create a new nftables connection and re-setup.
+		conn, connErr := nftables.New()
+		if connErr != nil {
+			n.logger.Error("nftables reconnect failed",
+				zap.Error(connErr),
+				zap.Int("consecutive_errors", n.consecutiveErrors))
+			return fmt.Errorf("nftables reconnect: %w", connErr)
+		}
+		n.conn = conn
+
+		if setupErr := n.setupLocked(); setupErr != nil {
+			n.logger.Error("nftables re-setup failed after reconnect",
+				zap.Error(setupErr),
+				zap.Int("consecutive_errors", n.consecutiveErrors))
+			return fmt.Errorf("nftables re-setup: %w", setupErr)
+		}
+
+		// Retry sync after successful reconnect.
+		if retryErr := n.syncJailLocked(entries); retryErr != nil {
+			n.consecutiveErrors++
+			n.logger.Error("nftables sync failed after reconnect",
+				zap.Error(retryErr),
+				zap.Int("consecutive_errors", n.consecutiveErrors))
+			return fmt.Errorf("nftables sync after reconnect: %w", retryErr)
+		}
+
+		n.logger.Info("nftables reconnected and synced successfully")
+	}
+
+	n.consecutiveErrors = 0
+	return nil
+}
+
+// syncJailLocked performs the actual nftables set sync. Caller must hold n.mu.
+func (n *nftReal) syncJailLocked(entries map[netip.Addr]jailEntry) error {
 	now := time.Now().UnixNano()
 
 	// Rebuild sets from scratch (flush + re-add).

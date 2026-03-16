@@ -58,6 +58,7 @@ type xdpReal struct {
 	xdpLink link.Link
 	logger  *zap.Logger
 	active  bool
+	inMap   map[netip.Addr]struct{} // tracks what's currently in the BPF jail map
 }
 
 func newXDPManager(ifName string, logger *zap.Logger) xdpManager {
@@ -115,6 +116,7 @@ func (x *xdpReal) Setup() error {
 	}
 	x.xdpLink = xdpLink
 	x.active = true
+	x.inMap = make(map[netip.Addr]struct{})
 
 	x.logger.Info("XDP program attached",
 		zap.String("iface", x.ifName),
@@ -133,54 +135,58 @@ func (x *xdpReal) SyncJail(entries map[netip.Addr]jailEntry) error {
 	now := time.Now().UnixNano()
 	jailMap := x.objs.JailMap
 
-	// Strategy: batch update. The BPF LPM trie doesn't support flush,
-	// so we need to track what's in the map and compute diffs. For
-	// simplicity (and because jail populations are small), we delete
-	// all existing entries then re-add current ones.
-	//
-	// For the LPM trie, iteration + delete is the only way to flush.
-	var cursor xdpDropLpmKey
-	var keysToDelete []xdpDropLpmKey
-	for {
-		var nextKey xdpDropLpmKey
-		if err := jailMap.NextKey(&cursor, &nextKey); err != nil {
-			break // iteration done
-		}
-		keysToDelete = append(keysToDelete, nextKey)
-		cursor = nextKey
-	}
-	for _, k := range keysToDelete {
-		jailMap.Delete(&k)
-	}
-
-	// Add current jail entries
-	dummyVal := uint8(1)
+	// Build wanted set from non-expired entries.
+	wanted := make(map[netip.Addr]struct{}, len(entries))
 	for addr, e := range entries {
-		if now >= e.ExpiresAt {
-			continue
+		if now < e.ExpiresAt {
+			wanted[addr] = struct{}{}
 		}
+	}
 
-		var key xdpDropLpmKey
-		key.Prefixlen = 128 // full match (v4-mapped-v6)
-
-		if addr.Is4() {
-			// Map to v4-mapped-v6: ::ffff:a.b.c.d
-			a4 := addr.As4()
-			key.Addr[10] = 0xff
-			key.Addr[11] = 0xff
-			copy(key.Addr[12:], a4[:])
-		} else {
-			a16 := addr.As16()
-			copy(key.Addr[:], a16[:])
+	// Delete entries in inMap but not in wanted.
+	for addr := range x.inMap {
+		if _, ok := wanted[addr]; !ok {
+			key := x.addrToLpmKey(addr)
+			if err := jailMap.Delete(&key); err != nil {
+				x.logger.Warn("XDP: failed to delete jail entry",
+					zap.String("ip", addr.String()), zap.Error(err))
+			}
+			delete(x.inMap, addr)
 		}
+	}
 
-		if err := jailMap.Put(&key, &dummyVal); err != nil {
-			x.logger.Warn("XDP: failed to add jail entry",
-				zap.String("ip", addr.String()), zap.Error(err))
+	// Add entries in wanted but not in inMap.
+	dummyVal := uint8(1)
+	for addr := range wanted {
+		if _, ok := x.inMap[addr]; !ok {
+			key := x.addrToLpmKey(addr)
+			if err := jailMap.Put(&key, &dummyVal); err != nil {
+				x.logger.Warn("XDP: failed to add jail entry",
+					zap.String("ip", addr.String()), zap.Error(err))
+				continue
+			}
+			x.inMap[addr] = struct{}{}
 		}
 	}
 
 	return nil
+}
+
+// addrToLpmKey converts a netip.Addr to a v4-mapped-v6 LPM trie key.
+func (x *xdpReal) addrToLpmKey(addr netip.Addr) xdpDropLpmKey {
+	var key xdpDropLpmKey
+	key.Prefixlen = 128 // full match (v4-mapped-v6)
+
+	if addr.Is4() {
+		a4 := addr.As4()
+		key.Addr[10] = 0xff
+		key.Addr[11] = 0xff
+		copy(key.Addr[12:], a4[:])
+	} else {
+		a16 := addr.As16()
+		copy(key.Addr[:], a16[:])
+	}
+	return key
 }
 
 func (x *xdpReal) Stats() (passed, dropped uint64) {

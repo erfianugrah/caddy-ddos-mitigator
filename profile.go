@@ -6,7 +6,6 @@
 //
 //   - Path diversity: unique paths / total requests (users browse many pages, bots hit one)
 //   - Method diversity: unique methods / total requests
-//   - Status entropy: response status code diversity
 //   - Request rate: requests per second (high rate alone isn't sufficient, combined with low diversity it is)
 //
 // Inspired by Cloudflare's anomaly detection research: variables that follow
@@ -18,6 +17,8 @@
 package ddosmitigator
 
 import (
+	"container/list"
+	"hash/fnv"
 	"math"
 	"net/netip"
 	"sync"
@@ -34,25 +35,26 @@ type ipProfile struct {
 	LastSeen    int64 // unix nano
 	UniquePaths int
 	Methods     map[string]int
-	StatusCodes map[int]int
 
 	// HyperLogLog-like path tracking: use a small set for exact counting
 	// up to a limit, then switch to approximate. For simplicity, we use
 	// a bounded map (max 256 unique paths tracked).
 	paths map[string]struct{}
+
+	// LRU eviction support: element in the per-shard LRU list.
+	lruElem *list.Element
 }
 
 const maxTrackedPaths = 256
 
 func newIPProfile() *ipProfile {
 	return &ipProfile{
-		Methods:     make(map[string]int, 4),
-		StatusCodes: make(map[int]int, 8),
-		paths:       make(map[string]struct{}, 32),
+		Methods: make(map[string]int, 4),
+		paths:   make(map[string]struct{}, 32),
 	}
 }
 
-func (p *ipProfile) record(method, path string, status int) {
+func (p *ipProfile) record(method, path string) {
 	now := time.Now().UnixNano()
 	if p.FirstSeen == 0 {
 		p.FirstSeen = now
@@ -61,7 +63,6 @@ func (p *ipProfile) record(method, path string, status int) {
 	p.Requests++
 
 	p.Methods[method]++
-	p.StatusCodes[status]++
 
 	if len(p.paths) < maxTrackedPaths {
 		if _, exists := p.paths[path]; !exists {
@@ -89,28 +90,6 @@ func (p *ipProfile) MethodDiversity() float64 {
 		return 1.0
 	}
 	return float64(len(p.Methods)) / float64(p.Requests)
-}
-
-// StatusEntropy measures the diversity of response status codes.
-// Uses normalized Shannon entropy. Range: 0.0 (all same) to 1.0 (uniform).
-func (p *ipProfile) StatusEntropy() float64 {
-	if p.Requests == 0 || len(p.StatusCodes) <= 1 {
-		return 0.0
-	}
-	total := float64(p.Requests)
-	entropy := 0.0
-	for _, count := range p.StatusCodes {
-		prob := float64(count) / total
-		if prob > 0 {
-			entropy -= prob * math.Log2(prob)
-		}
-	}
-	// Normalize by max possible entropy
-	maxEntropy := math.Log2(float64(len(p.StatusCodes)))
-	if maxEntropy == 0 {
-		return 0
-	}
-	return entropy / maxEntropy
 }
 
 // RequestRate returns requests per second since first seen.
@@ -169,45 +148,80 @@ func (p *ipProfile) AnomalyScore() float64 {
 
 // ─── IP Tracker ─────────────────────────────────────────────────────
 
-// ipTracker manages per-IP behavioral profiles with bounded memory.
-type ipTracker struct {
+const trackerShards = 64
+
+// trackerShard holds a subset of IP profiles with its own lock and LRU list.
+type trackerShard struct {
 	mu       sync.RWMutex
 	profiles map[netip.Addr]*ipProfile
-	maxIPs   int
-	ttl      time.Duration
+	lru      *list.List
+	maxIPs   int // per-shard capacity: global maxIPs / trackerShards
+}
+
+// lruEntry is stored as list.Element.Value for LRU eviction.
+type lruEntry struct {
+	ip netip.Addr
+}
+
+// ipTracker manages per-IP behavioral profiles with bounded memory.
+// Uses 64 shards for reduced lock contention and per-shard LRU eviction.
+type ipTracker struct {
+	shards [trackerShards]trackerShard
+	ttl    time.Duration
 }
 
 func newIPTracker(maxIPs int, ttl time.Duration) *ipTracker {
-	return &ipTracker{
-		profiles: make(map[netip.Addr]*ipProfile, 256),
-		maxIPs:   maxIPs,
-		ttl:      ttl,
+	perShard := maxIPs / trackerShards
+	if perShard < 1 {
+		perShard = 1
 	}
+	t := &ipTracker{ttl: ttl}
+	for i := range t.shards {
+		t.shards[i] = trackerShard{
+			profiles: make(map[netip.Addr]*ipProfile, 64),
+			lru:      list.New(),
+			maxIPs:   perShard,
+		}
+	}
+	return t
+}
+
+func (t *ipTracker) shard(ip netip.Addr) *trackerShard {
+	b := ip.As16()
+	h := fnv.New32a()
+	h.Write(b[:])
+	return &t.shards[h.Sum32()%trackerShards]
 }
 
 // Record adds a request observation to the IP's behavioral profile.
-func (t *ipTracker) Record(ip netip.Addr, method, path, ua string, status int) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+func (t *ipTracker) Record(ip netip.Addr, method, path, ua string) {
+	s := t.shard(ip)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	p, exists := t.profiles[ip]
+	p, exists := s.profiles[ip]
 	if !exists {
-		// Evict if at capacity (simple: drop oldest entry)
-		if len(t.profiles) >= t.maxIPs {
-			t.evictOldestLocked()
+		// Evict from front of LRU (oldest) if at per-shard capacity
+		if len(s.profiles) >= s.maxIPs {
+			s.evictOldestLocked()
 		}
 		p = newIPProfile()
-		t.profiles[ip] = p
+		s.profiles[ip] = p
+		p.lruElem = s.lru.PushBack(&lruEntry{ip: ip})
+	} else {
+		// Move to back of LRU (most recently used)
+		s.lru.MoveToBack(p.lruElem)
 	}
-	p.record(method, path, status)
+	p.record(method, path)
 }
 
 // Profile returns the behavioral profile for an IP, or nil if not tracked.
 func (t *ipTracker) Profile(ip netip.Addr) *ipProfile {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+	s := t.shard(ip)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
-	p, exists := t.profiles[ip]
+	p, exists := s.profiles[ip]
 	if !exists {
 		return nil
 	}
@@ -219,9 +233,17 @@ func (t *ipTracker) Profile(ip netip.Addr) *ipProfile {
 }
 
 // Score returns the anomaly score for an IP. Returns 0 if not tracked.
+// Computes AnomalyScore under the shard RLock to prevent data races.
 func (t *ipTracker) Score(ip netip.Addr) float64 {
-	p := t.Profile(ip)
-	if p == nil {
+	s := t.shard(ip)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	p, exists := s.profiles[ip]
+	if !exists {
+		return 0
+	}
+	if time.Since(time.Unix(0, p.LastSeen)) > t.ttl {
 		return 0
 	}
 	return p.AnomalyScore()
@@ -231,45 +253,61 @@ func (t *ipTracker) Score(ip netip.Addr) float64 {
 // re-evaluated from scratch. Called when an IP is manually unjailed via
 // the wafctl API to prevent immediate re-jail from stale profile data.
 func (t *ipTracker) Reset(ip netip.Addr) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	delete(t.profiles, ip)
+	s := t.shard(ip)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	p, exists := s.profiles[ip]
+	if exists {
+		s.lru.Remove(p.lruElem)
+		delete(s.profiles, ip)
+	}
 }
 
-// Count returns the number of tracked IPs.
+// Count returns the total number of tracked IPs across all shards.
 func (t *ipTracker) Count() int {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return len(t.profiles)
+	total := 0
+	for i := range t.shards {
+		s := &t.shards[i]
+		s.mu.RLock()
+		total += len(s.profiles)
+		s.mu.RUnlock()
+	}
+	return total
 }
 
-// Sweep removes expired profiles.
+// Sweep removes expired profiles across all shards. Returns count removed.
 func (t *ipTracker) Sweep() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	now := time.Now().UnixNano()
 	cutoff := now - int64(t.ttl)
-	removed := 0
-	for ip, p := range t.profiles {
-		if p.LastSeen < cutoff {
-			delete(t.profiles, ip)
-			removed++
+	total := 0
+
+	for i := range t.shards {
+		s := &t.shards[i]
+		s.mu.Lock()
+		for ip, p := range s.profiles {
+			if p.LastSeen < cutoff {
+				s.lru.Remove(p.lruElem)
+				delete(s.profiles, ip)
+				total++
+			}
 		}
+		s.mu.Unlock()
 	}
-	return removed
+	return total
 }
 
-func (t *ipTracker) evictOldestLocked() {
-	var oldestIP netip.Addr
-	var oldestTime int64 = math.MaxInt64
-	for ip, p := range t.profiles {
-		if p.LastSeen < oldestTime {
-			oldestTime = p.LastSeen
-			oldestIP = ip
-		}
+// evictOldestLocked removes the LRU-front entry from this shard.
+// Caller must hold s.mu write lock.
+func (s *trackerShard) evictOldestLocked() {
+	front := s.lru.Front()
+	if front == nil {
+		return
 	}
-	if oldestIP.IsValid() {
-		delete(t.profiles, oldestIP)
+	entry := front.Value.(*lruEntry)
+	p := s.profiles[entry.ip]
+	if p != nil {
+		s.lru.Remove(p.lruElem)
 	}
+	delete(s.profiles, entry.ip)
 }

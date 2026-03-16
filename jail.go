@@ -139,6 +139,12 @@ func (j *ipJail) Count() int64 {
 
 // Sweep removes all expired entries from the jail. Returns the number removed.
 func (j *ipJail) Sweep() int {
+	return j.SweepWithCallback(nil)
+}
+
+// SweepWithCallback removes all expired entries and calls onRemove for each
+// removed address (e.g. to decrement CIDR counters). Returns the number removed.
+func (j *ipJail) SweepWithCallback(onRemove func(netip.Addr)) int {
 	now := time.Now().UnixNano()
 	total := 0
 
@@ -149,6 +155,9 @@ func (j *ipJail) Sweep() int {
 			if now >= e.ExpiresAt {
 				delete(s.entries, addr)
 				total++
+				if onRemove != nil {
+					onRemove(addr)
+				}
 			}
 		}
 		s.mu.Unlock()

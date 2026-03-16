@@ -11,6 +11,7 @@ package ddosmitigator
 import (
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,9 +23,11 @@ const (
 )
 
 // cidrAggregator tracks per-prefix jail counts and promotes prefixes.
+// Uses per-prefix atomic counters (O(1)) instead of O(N) snapshot scanning.
 type cidrAggregator struct {
 	mu          sync.Mutex
 	promoted    map[netip.Prefix]time.Time // promoted prefixes → expiry
+	counters    map[netip.Prefix]*atomic.Int32
 	thresholdV4 int
 	thresholdV6 int
 }
@@ -32,6 +35,7 @@ type cidrAggregator struct {
 func newCIDRAggregatorWithThresholds(v4, v6 int) *cidrAggregator {
 	return &cidrAggregator{
 		promoted:    make(map[netip.Prefix]time.Time),
+		counters:    make(map[netip.Prefix]*atomic.Int32),
 		thresholdV4: v4,
 		thresholdV6: v6,
 	}
@@ -40,21 +44,74 @@ func newCIDRAggregatorWithThresholds(v4, v6 int) *cidrAggregator {
 func newCIDRAggregator() *cidrAggregator {
 	return &cidrAggregator{
 		promoted: make(map[netip.Prefix]time.Time),
+		counters: make(map[netip.Prefix]*atomic.Int32),
 	}
 }
 
-// Check evaluates whether a newly jailed IP should trigger prefix promotion.
-// Called after an IP is added to the jail. Returns the prefix to promote, if any.
-func (c *cidrAggregator) Check(jail *ipJail, addr netip.Addr, ttl time.Duration) *netip.Prefix {
+// prefixFor returns the aggregation prefix for an address.
+func prefixFor(addr netip.Addr) (netip.Prefix, bool) {
 	var prefixLen int
 	if addr.Is4() {
 		prefixLen = cidrPrefixV4
 	} else {
 		prefixLen = cidrPrefixV6
 	}
-
 	prefix, err := addr.Prefix(prefixLen)
 	if err != nil {
+		return netip.Prefix{}, false
+	}
+	return prefix, true
+}
+
+// IncrementPrefix atomically increments the counter for the IP's prefix.
+// Called after an IP is added to the jail.
+func (c *cidrAggregator) IncrementPrefix(addr netip.Addr) {
+	prefix, ok := prefixFor(addr)
+	if !ok {
+		return
+	}
+
+	c.mu.Lock()
+	cnt, exists := c.counters[prefix]
+	if !exists {
+		cnt = &atomic.Int32{}
+		c.counters[prefix] = cnt
+	}
+	c.mu.Unlock()
+
+	cnt.Add(1)
+}
+
+// DecrementPrefix atomically decrements the counter for the IP's prefix.
+// Called when a jailed IP expires or is removed.
+func (c *cidrAggregator) DecrementPrefix(addr netip.Addr) {
+	prefix, ok := prefixFor(addr)
+	if !ok {
+		return
+	}
+
+	c.mu.Lock()
+	cnt, exists := c.counters[prefix]
+	c.mu.Unlock()
+
+	if exists {
+		if cnt.Add(-1) <= 0 {
+			// Clean up zero/negative counters to prevent map growth.
+			c.mu.Lock()
+			if cnt.Load() <= 0 {
+				delete(c.counters, prefix)
+			}
+			c.mu.Unlock()
+		}
+	}
+}
+
+// Check evaluates whether a newly jailed IP should trigger prefix promotion.
+// Called after an IP is added to the jail. Returns the prefix to promote, if any.
+// Uses per-prefix atomic counters for O(1) lookup instead of O(N) snapshot scan.
+func (c *cidrAggregator) Check(addr netip.Addr, ttl time.Duration) *netip.Prefix {
+	prefix, ok := prefixFor(addr)
+	if !ok {
 		return nil
 	}
 
@@ -66,22 +123,16 @@ func (c *cidrAggregator) Check(jail *ipJail, addr netip.Addr, ttl time.Duration)
 		return nil
 	}
 
-	// Count jailed IPs in this prefix
-	snap := jail.Snapshot()
-	count := 0
-	for ip := range snap {
-		p, err := ip.Prefix(prefixLen)
-		if err != nil {
-			continue
-		}
-		if p == prefix {
-			count++
-		}
+	// Read the counter for this prefix.
+	cnt, exists := c.counters[prefix]
+	count := int32(0)
+	if exists {
+		count = cnt.Load()
 	}
 
-	threshold := c.thresholdV4
+	threshold := int32(c.thresholdV4)
 	if !addr.Is4() {
-		threshold = c.thresholdV6
+		threshold = int32(c.thresholdV6)
 	}
 
 	if count >= threshold {

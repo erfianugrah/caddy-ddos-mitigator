@@ -33,10 +33,10 @@ const (
 
 // computeFingerprint hashes request attributes according to the given strategy.
 // Returns an 8-byte hash suitable as a CMS key.
-func computeFingerprint(strat fingerprintStrategy, addr netip.Addr, method, rawPath, ua string) [8]byte {
+func computeFingerprint(strat fingerprintStrategy, addr netip.Addr, method, rawPath, ua string, pathDepth int) [8]byte {
 	h := fnv.New64a()
 	ip16 := addr.As16()
-	normPath := normalizePath(rawPath)
+	normPath := normalizePath(rawPath, pathDepth)
 
 	switch strat {
 	case fpFull:
@@ -73,8 +73,9 @@ func computeFingerprint(strat fingerprintStrategy, addr netip.Addr, method, rawP
 // ─── Path Normalization ─────────────────────────────────────────────
 
 // normalizePath strips query strings, collapses traversal (/../, /./),
-// removes trailing slashes, and lowercases the path.
-func normalizePath(p string) string {
+// removes trailing slashes, and lowercases the path. If maxDepth > 0,
+// only the first maxDepth path segments are kept.
+func normalizePath(p string, maxDepth int) string {
 	// URL-decode first to normalize encoded characters
 	if decoded, err := url.PathUnescape(p); err == nil {
 		p = decoded
@@ -90,6 +91,14 @@ func normalizePath(p string) string {
 	p = path.Clean(p)
 	if p == "." {
 		p = "/"
+	}
+
+	// Truncate to maxDepth segments if configured.
+	if maxDepth > 0 {
+		segments := strings.Split(p, "/")
+		if len(segments) > maxDepth+1 { // +1 for leading empty string from "/"
+			p = strings.Join(segments[:maxDepth+1], "/")
+		}
 	}
 
 	// Lowercase

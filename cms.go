@@ -9,6 +9,7 @@
 package ddosmitigator
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"hash/fnv"
 	"math"
@@ -38,9 +39,12 @@ func newCountMinSketch(depth, width int) *countMinSketch {
 	}
 	for i := range depth {
 		cms.matrix[i] = make([]atomic.Int64, width)
-		// Deterministic seeds derived from row index.
-		// Each row uses a different seed to produce independent hash functions.
-		cms.seeds[i] = uint64(i)*0x517cc1b727220a95 + 0x6c62272e07bb0142
+		// Cryptographically random seeds for independent hash functions.
+		var buf [8]byte
+		if _, err := rand.Read(buf[:]); err != nil {
+			panic("crypto/rand failed: " + err.Error())
+		}
+		cms.seeds[i] = binary.LittleEndian.Uint64(buf[:])
 	}
 	return cms
 }
