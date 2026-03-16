@@ -1,5 +1,12 @@
 # caddy-ddos-mitigator — Design Plan
 
+> **Note:** This plan was written during initial design. The implementation has
+> evolved significantly. For current documentation, see **[README.md](README.md)**.
+> Key changes from this plan: threshold is now 0.65 (behavioral scoring, not z-score 4.0),
+> handler ordering is `log_append first → ddos_mitigator → policy_engine`,
+> detection uses per-IP behavioral profiling (path diversity) instead of CMS frequency z-scores,
+> CIDR aggregation and profile reset on unjail are implemented.
+
 Caddy plugin for adaptive DDoS/DoS mitigation, compiled into the Caddy binary
 via xcaddy alongside the existing plugins. Registers three module types in one package:
 
