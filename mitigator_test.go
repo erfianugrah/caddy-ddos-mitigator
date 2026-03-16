@@ -141,9 +141,15 @@ func TestValidate_RejectsInvalid(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			m := &DDOSMitigator{
-				Threshold:   4.0,
-				BasePenalty: caddy.Duration(60 * time.Second),
-				MaxPenalty:  caddy.Duration(24 * time.Hour),
+				Threshold:       4.0,
+				BasePenalty:     caddy.Duration(60 * time.Second),
+				MaxPenalty:      caddy.Duration(24 * time.Hour),
+				CMSWidth:        8192,
+				CMSDepth:        4,
+				CIDRThresholdV4: 5,
+				CIDRThresholdV6: 5,
+				ProfileMaxIPs:   100000,
+				WarmupRequests:  1000,
 			}
 			tt.mod(m)
 			if err := m.Validate(); err == nil {
@@ -155,9 +161,15 @@ func TestValidate_RejectsInvalid(t *testing.T) {
 
 func TestValidate_AcceptsValid(t *testing.T) {
 	m := &DDOSMitigator{
-		Threshold:   0.65,
-		BasePenalty: caddy.Duration(60 * time.Second),
-		MaxPenalty:  caddy.Duration(24 * time.Hour),
+		Threshold:       0.65,
+		BasePenalty:     caddy.Duration(60 * time.Second),
+		MaxPenalty:      caddy.Duration(24 * time.Hour),
+		CMSWidth:        8192,
+		CMSDepth:        4,
+		CIDRThresholdV4: 5,
+		CIDRThresholdV6: 5,
+		ProfileMaxIPs:   100000,
+		WarmupRequests:  1000,
 	}
 	if err := m.Validate(); err != nil {
 		t.Fatalf("valid config rejected: %v", err)

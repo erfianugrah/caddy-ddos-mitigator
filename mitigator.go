@@ -161,6 +161,9 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 	// Initialize domain objects.
 	// Use the jail registry so L4 handlers can share the same jail.
 	if m.JailFile != "" {
+		if err := validateJailPath(m.JailFile); err != nil {
+			return err
+		}
 		m.jail = getOrCreateJail(m.JailFile)
 	} else {
 		m.jail = newIPJail()
@@ -184,7 +187,11 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 	}
 	m.tracker = newIPTracker(m.ProfileMaxIPs, time.Duration(m.ProfileTTL))
 	m.cidr = newCIDRAggregatorWithThresholds(m.CIDRThresholdV4, m.CIDRThresholdV6)
-	m.whitelist = newWhitelist(m.WhitelistCIDRs)
+	wl, err := newWhitelist(m.WhitelistCIDRs)
+	if err != nil {
+		return fmt.Errorf("whitelist: %w", err)
+	}
+	m.whitelist = wl
 	m.strategy.Store(int32(fpFull))
 
 	if m.NftSyncInterval == 0 {
@@ -293,6 +300,24 @@ func (m *DDOSMitigator) Validate() error {
 		return fmt.Errorf("max_penalty (%s) must be >= base_penalty (%s)",
 			time.Duration(m.MaxPenalty), time.Duration(m.BasePenalty))
 	}
+	if m.CMSWidth <= 0 {
+		return fmt.Errorf("cms_width must be positive, got %d", m.CMSWidth)
+	}
+	if m.CMSDepth <= 0 {
+		return fmt.Errorf("cms_depth must be positive, got %d", m.CMSDepth)
+	}
+	if m.CIDRThresholdV4 <= 0 {
+		return fmt.Errorf("cidr_threshold_v4 must be positive, got %d", m.CIDRThresholdV4)
+	}
+	if m.CIDRThresholdV6 <= 0 {
+		return fmt.Errorf("cidr_threshold_v6 must be positive, got %d", m.CIDRThresholdV6)
+	}
+	if m.ProfileMaxIPs <= 0 {
+		return fmt.Errorf("profile_max_ips must be positive, got %d", m.ProfileMaxIPs)
+	}
+	if m.WarmupRequests < 0 {
+		return fmt.Errorf("warmup_requests must be non-negative, got %d", m.WarmupRequests)
+	}
 	return nil
 }
 
@@ -319,6 +344,7 @@ func (m *DDOSMitigator) Cleanup() error {
 			m.logger.Error("failed to write jail file on cleanup",
 				zap.String("path", m.JailFile), zap.Error(err))
 		}
+		releaseJail(m.JailFile)
 	}
 	return nil
 }
@@ -433,7 +459,7 @@ func clientAddr(r *http.Request) (netip.Addr, bool) {
 	if val := caddyhttp.GetVar(r.Context(), caddyhttp.ClientIPVarKey); val != nil {
 		if ipStr, ok := val.(string); ok {
 			if addr, err := netip.ParseAddr(ipStr); err == nil {
-				return addr, true
+				return addr.Unmap(), true
 			}
 		}
 	}
@@ -447,7 +473,7 @@ func clientAddr(r *http.Request) (netip.Addr, bool) {
 	if err != nil {
 		return netip.Addr{}, false
 	}
-	return addr, true
+	return addr.Unmap(), true
 }
 
 // ─── Background Goroutines ──────────────────────────────────────────
@@ -509,9 +535,13 @@ func (m *DDOSMitigator) runFileSync(ctx context.Context) {
 				}
 			}
 
-			// Write current jail state to file (for wafctl to read)
-			if err := writeJailFile(m.JailFile, m.jail); err != nil {
-				m.logger.Warn("jail file write error", zap.Error(err))
+			// Write current jail state to file (for wafctl to read),
+			// but only if the jail has been modified since the last write.
+			if m.jail.dirty.CompareAndSwap(true, false) {
+				if err := writeJailFile(m.JailFile, m.jail); err != nil {
+					m.logger.Warn("jail file write error", zap.Error(err))
+					m.jail.dirty.Store(true) // restore flag on failure
+				}
 			}
 		}
 	}

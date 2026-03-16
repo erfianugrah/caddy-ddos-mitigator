@@ -14,6 +14,21 @@ import (
 	"time"
 )
 
+// ─── Jail Path Validation ───────────────────────────────────────────
+
+// validateJailPath checks that the jail file path is absolute and not a symlink.
+func validateJailPath(path string) error {
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("jail_file must be an absolute path, got %q", path)
+	}
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("jail_file %q is a symlink, refusing", path)
+		}
+	}
+	return nil
+}
+
 // ─── Whitelist ──────────────────────────────────────────────────────
 
 // whitelist holds a static set of CIDR prefixes that bypass jail checks.
@@ -22,17 +37,17 @@ type whitelist struct {
 }
 
 // newWhitelist parses CIDR strings and returns a whitelist.
-// Invalid CIDRs are silently skipped.
-func newWhitelist(cidrs []string) *whitelist {
+// Returns an error if any CIDR is invalid.
+func newWhitelist(cidrs []string) (*whitelist, error) {
 	w := &whitelist{}
 	for _, s := range cidrs {
 		p, err := netip.ParsePrefix(s)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("invalid whitelist CIDR %q: %w", s, err)
 		}
 		w.prefixes = append(w.prefixes, p)
 	}
-	return w
+	return w, nil
 }
 
 // Contains returns true if the address falls within any whitelisted prefix.
@@ -122,7 +137,7 @@ func writeJailFile(path string, j *ipJail) error {
 	if err != nil {
 		return fmt.Errorf("marshal jail file: %w", err)
 	}
-	return atomicWriteFile(path, data, 0644)
+	return atomicWriteFile(path, data, 0660)
 }
 
 // readJailFile reads a jail file and merges its entries into the jail.

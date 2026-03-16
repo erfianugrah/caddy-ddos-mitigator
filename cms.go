@@ -99,10 +99,15 @@ func (cms *countMinSketch) Estimate(key []byte) int64 {
 func (cms *countMinSketch) Decay(factor float64) {
 	for i := range cms.depth {
 		for j := range cms.width {
-			old := cms.matrix[i][j].Load()
-			if old > 0 {
+			for {
+				old := cms.matrix[i][j].Load()
+				if old <= 0 {
+					break
+				}
 				newVal := int64(float64(old) * factor)
-				cms.matrix[i][j].Store(newVal)
+				if cms.matrix[i][j].CompareAndSwap(old, newVal) {
+					break
+				}
 			}
 		}
 	}

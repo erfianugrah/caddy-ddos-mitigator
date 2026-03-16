@@ -20,7 +20,6 @@ package ddosmitigator
 
 import (
 	"fmt"
-	"net"
 	"net/netip"
 	"sync"
 	"time"
@@ -273,14 +272,3 @@ func (nftNoop) Setup() error                                    { return nil }
 func (nftNoop) SyncJail(entries map[netip.Addr]jailEntry) error { return nil }
 func (nftNoop) Cleanup() error                                  { return nil }
 func (nftNoop) Available() bool                                 { return false }
-
-// ─── Helper: addr to net.IP for nftables ────────────────────────────
-
-func addrToNetIP(addr netip.Addr) net.IP {
-	if addr.Is4() {
-		a := addr.As4()
-		return net.IP(a[:])
-	}
-	a := addr.As16()
-	return net.IP(a[:])
-}

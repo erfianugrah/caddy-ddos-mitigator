@@ -32,6 +32,7 @@ type jailEntry struct {
 type ipJail struct {
 	shards [jailShards]jailShard
 	count  atomic.Int64
+	dirty  atomic.Bool
 }
 
 type jailShard struct {
@@ -79,6 +80,7 @@ func (j *ipJail) Add(addr netip.Addr, ttl time.Duration, reason string, infracti
 	if !exists {
 		j.count.Add(1)
 	}
+	j.dirty.Store(true)
 }
 
 // IsJailed returns true if the IP is in the jail and has not expired.
@@ -179,25 +181,34 @@ func (j *ipJail) Snapshot() map[netip.Addr]jailEntry {
 
 // ─── Jail Registry (shared between L7 and L4 modules) ──────────────
 
-// jailRegistry maps jail file paths to shared ipJail instances.
-// When an L7 handler provisions with a jail_file, it registers its jail here.
-// The L4 handler looks it up by the same path during its own Provision.
+// jailRegistry maps jail file paths to shared ipJail instances with reference
+// counting. When an L7 handler provisions with a jail_file, it registers its
+// jail here. The L4 handler looks it up by the same path during its own Provision.
+
+// jailRegistryEntry wraps an ipJail with a reference count.
+type jailRegistryEntry struct {
+	jail     *ipJail
+	refCount int
+}
+
 var (
 	jailRegistryMu sync.Mutex
-	jailRegistry   = map[string]*ipJail{}
+	jailRegistry   = map[string]*jailRegistryEntry{}
 )
 
 // getOrCreateJail returns the shared jail for a jail file path.
-// If no jail exists for that path, it creates one. Thread-safe.
+// If no jail exists for that path, it creates one. Increments the
+// reference count. Thread-safe.
 func getOrCreateJail(jailFile string) *ipJail {
 	jailRegistryMu.Lock()
 	defer jailRegistryMu.Unlock()
 
-	if j, ok := jailRegistry[jailFile]; ok {
-		return j
+	if entry, ok := jailRegistry[jailFile]; ok {
+		entry.refCount++
+		return entry.jail
 	}
 	j := newIPJail()
-	jailRegistry[jailFile] = j
+	jailRegistry[jailFile] = &jailRegistryEntry{jail: j, refCount: 1}
 	return j
 }
 
@@ -205,5 +216,24 @@ func getOrCreateJail(jailFile string) *ipJail {
 func getJail(jailFile string) *ipJail {
 	jailRegistryMu.Lock()
 	defer jailRegistryMu.Unlock()
-	return jailRegistry[jailFile]
+	if entry, ok := jailRegistry[jailFile]; ok {
+		return entry.jail
+	}
+	return nil
+}
+
+// releaseJail decrements the reference count for the jail at the given path.
+// When the count reaches zero, the entry is removed from the registry.
+func releaseJail(jailFile string) {
+	jailRegistryMu.Lock()
+	defer jailRegistryMu.Unlock()
+
+	entry, ok := jailRegistry[jailFile]
+	if !ok {
+		return
+	}
+	entry.refCount--
+	if entry.refCount <= 0 {
+		delete(jailRegistry, jailFile)
+	}
 }

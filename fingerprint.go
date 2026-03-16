@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"hash/fnv"
 	"net/netip"
+	"net/url"
 	"path"
 	"strings"
 )
@@ -74,6 +75,11 @@ func computeFingerprint(strat fingerprintStrategy, addr netip.Addr, method, rawP
 // normalizePath strips query strings, collapses traversal (/../, /./),
 // removes trailing slashes, and lowercases the path.
 func normalizePath(p string) string {
+	// URL-decode first to normalize encoded characters
+	if decoded, err := url.PathUnescape(p); err == nil {
+		p = decoded
+	}
+
 	// Strip query string
 	if i := strings.IndexByte(p, '?'); i >= 0 {
 		p = p[:i]

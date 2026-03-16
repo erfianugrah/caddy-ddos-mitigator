@@ -13,12 +13,15 @@ import (
 // --- Whitelist Tests ---
 
 func TestWhitelist_Contains(t *testing.T) {
-	wl := newWhitelist([]string{
+	wl, err := newWhitelist([]string{
 		"192.168.0.0/16",
 		"10.0.0.0/8",
 		"127.0.0.0/8",
 		"::1/128",
 	})
+	if err != nil {
+		t.Fatalf("newWhitelist: %v", err)
+	}
 
 	tests := []struct {
 		ip   string
@@ -45,20 +48,32 @@ func TestWhitelist_Contains(t *testing.T) {
 }
 
 func TestWhitelist_Empty(t *testing.T) {
-	wl := newWhitelist(nil)
+	wl, err := newWhitelist(nil)
+	if err != nil {
+		t.Fatalf("newWhitelist(nil): %v", err)
+	}
 	if wl.Contains(netip.MustParseAddr("192.168.1.1")) {
 		t.Fatal("empty whitelist should not contain anything")
 	}
 }
 
 func TestWhitelist_InvalidCIDR(t *testing.T) {
-	// Invalid CIDRs should be silently skipped
-	wl := newWhitelist([]string{"not-a-cidr", "10.0.0.0/8", "also-bad"})
+	// Invalid CIDRs should now return an error
+	_, err := newWhitelist([]string{"not-a-cidr", "10.0.0.0/8", "also-bad"})
+	if err == nil {
+		t.Fatal("newWhitelist with invalid CIDR should return error")
+	}
+
+	// Valid-only list should succeed
+	wl, err := newWhitelist([]string{"10.0.0.0/8"})
+	if err != nil {
+		t.Fatalf("newWhitelist with valid CIDR: %v", err)
+	}
 	if !wl.Contains(netip.MustParseAddr("10.0.0.1")) {
-		t.Fatal("valid CIDR should still work when mixed with invalid ones")
+		t.Fatal("valid CIDR should match")
 	}
 	if wl.Contains(netip.MustParseAddr("192.168.1.1")) {
-		t.Fatal("invalid CIDR should not match anything")
+		t.Fatal("non-matching CIDR should not match")
 	}
 }
 

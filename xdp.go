@@ -90,6 +90,9 @@ func (x *xdpReal) Setup() error {
 	if err != nil {
 		return fmt.Errorf("interface %q not found: %w", x.ifName, err)
 	}
+	if iface.Flags&net.FlagLoopback != 0 {
+		return fmt.Errorf("refusing to attach XDP to loopback interface %q", x.ifName)
+	}
 
 	objs := &xdpDropObjects{}
 	if err := loadXdpDropObjects(objs, nil); err != nil {
