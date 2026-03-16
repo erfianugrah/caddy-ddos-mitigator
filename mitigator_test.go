@@ -3,7 +3,6 @@ package ddosmitigator
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -92,8 +91,8 @@ func TestProvision_Defaults(t *testing.T) {
 		t.Fatalf("Provision with defaults: %v", err)
 	}
 
-	if m.Threshold != 4.0 {
-		t.Fatalf("default threshold: got %f, want 4.0", m.Threshold)
+	if m.Threshold != 0.65 {
+		t.Fatalf("default threshold: got %f, want 0.65", m.Threshold)
 	}
 	if m.jail == nil {
 		t.Fatal("jail should be initialized")
@@ -111,14 +110,14 @@ func TestProvision_Defaults(t *testing.T) {
 
 func TestProvision_CustomConfig(t *testing.T) {
 	m := provisionMitigator(t, func(m *DDOSMitigator) {
-		m.Threshold = 3.0
+		m.Threshold = 0.5
 		m.CMSWidth = 2048
 		m.CMSDepth = 3
 		m.WhitelistCIDRs = []string{"10.0.0.0/8", "192.168.0.0/16"}
 	})
 
-	if m.Threshold != 3.0 {
-		t.Fatalf("custom threshold: got %f, want 3.0", m.Threshold)
+	if m.Threshold != 0.5 {
+		t.Fatalf("custom threshold: got %f, want 0.5", m.Threshold)
 	}
 }
 
@@ -130,7 +129,7 @@ func TestValidate_RejectsInvalid(t *testing.T) {
 		mod  func(*DDOSMitigator)
 	}{
 		{"zero threshold", func(m *DDOSMitigator) { m.Threshold = 0 }},
-		{"negative threshold", func(m *DDOSMitigator) { m.Threshold = -1 }},
+		{"negative threshold", func(m *DDOSMitigator) { m.Threshold = -0.1 }},
 		{"zero base penalty", func(m *DDOSMitigator) { m.BasePenalty = 0 }},
 		{"zero max penalty", func(m *DDOSMitigator) { m.MaxPenalty = 0 }},
 		{"max < base penalty", func(m *DDOSMitigator) {
@@ -156,7 +155,7 @@ func TestValidate_RejectsInvalid(t *testing.T) {
 
 func TestValidate_AcceptsValid(t *testing.T) {
 	m := &DDOSMitigator{
-		Threshold:   4.0,
+		Threshold:   0.65,
 		BasePenalty: caddy.Duration(60 * time.Second),
 		MaxPenalty:  caddy.Duration(24 * time.Hour),
 	}
@@ -228,25 +227,15 @@ func TestServeHTTP_WhitelistBypassesJail(t *testing.T) {
 
 func TestServeHTTP_AutoJailsOnThresholdBreach(t *testing.T) {
 	m := provisionMitigator(t, func(m *DDOSMitigator) {
-		m.Threshold = 2.0 // Low threshold for easy triggering
-		m.CMSWidth = 256  // Small sketch for faster collision-free test
+		m.Threshold = 0.5 // Low behavioral threshold for easy triggering
+		m.CMSWidth = 256
 	})
 
-	// Build a baseline of diverse traffic — must exceed minObservationsForZScore
-	// so the stats engine produces actionable z-scores.
-	for i := range 1200 {
-		next := &nextHandler{}
-		w := httptest.NewRecorder()
-		addr := netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})
-		path := fmt.Sprintf("/normal/%d", i%50)
-		r := makeRequest("GET", path, addr.String()+":1234")
-		m.ServeHTTP(w, r, next)
-	}
-
-	// Now hammer from a single IP+path repeatedly — should trigger z-score breach
+	// Hammer from a single IP to a single path — low path diversity → high anomaly score.
+	// Behavioral model doesn't need warmup from other IPs; it evaluates per-IP diversity.
 	attacker := "198.51.100.99:12345"
 	var jailed bool
-	for range 2000 {
+	for range 200 {
 		next := &nextHandler{}
 		w := httptest.NewRecorder()
 		r := makeRequest("GET", "/attack", attacker)
@@ -358,7 +347,7 @@ func TestCleanup_StopsGoroutines(t *testing.T) {
 func TestJSON_RoundTrip(t *testing.T) {
 	original := &DDOSMitigator{
 		JailFile:       "/data/waf/jail.json",
-		Threshold:      3.5,
+		Threshold:      0.7,
 		BasePenalty:    caddy.Duration(90 * time.Second),
 		MaxPenalty:     caddy.Duration(12 * time.Hour),
 		WhitelistCIDRs: []string{"10.0.0.0/8", "192.168.0.0/16"},
@@ -374,8 +363,8 @@ func TestJSON_RoundTrip(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	if decoded.Threshold != 3.5 {
-		t.Fatalf("threshold: got %f, want 3.5", decoded.Threshold)
+	if decoded.Threshold != 0.7 {
+		t.Fatalf("threshold: got %f, want 0.7", decoded.Threshold)
 	}
 	if decoded.JailFile != "/data/waf/jail.json" {
 		t.Fatalf("jail_file: got %q", decoded.JailFile)

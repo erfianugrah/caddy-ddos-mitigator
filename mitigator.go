@@ -90,6 +90,7 @@ type DDOSMitigator struct {
 	jail      *ipJail
 	cms       *countMinSketch
 	stats     *adaptiveStats
+	tracker   *ipTracker
 	whitelist *whitelist
 	nft       nftManager
 	xdp       xdpManager
@@ -114,7 +115,7 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 
 	// Apply defaults
 	if m.Threshold == 0 {
-		m.Threshold = 4.0
+		m.Threshold = 0.65 // behavioral anomaly score: 0.0 (normal) to 1.0 (flood)
 	}
 	if m.BasePenalty == 0 {
 		m.BasePenalty = caddy.Duration(60 * time.Second)
@@ -147,6 +148,7 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 	}
 	m.cms = newCountMinSketch(m.CMSDepth, m.CMSWidth)
 	m.stats = newAdaptiveStats()
+	m.tracker = newIPTracker(100000, 10*time.Minute)
 	m.whitelist = newWhitelist(m.WhitelistCIDRs)
 	m.strategy.Store(int32(fpFull))
 
@@ -307,28 +309,32 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		return nil
 	}
 
-	// 3. Fingerprint + adaptive threshold
+	// 3. Record behavioral profile + update CMS for EPS tracking
+	m.tracker.Record(addr, r.Method, r.URL.Path, r.UserAgent(), 0) // status filled by response
 	strat := fingerprintStrategy(m.strategy.Load())
 	fp := computeFingerprint(strat, addr, r.Method, r.URL.Path, r.UserAgent())
-	freq := m.cms.Increment(fp[:])
-	m.stats.Observe(float64(freq))
-	z := m.stats.ZScore(float64(freq))
+	m.cms.Increment(fp[:])
+	m.stats.Observe(1.0) // observation count for EWMA/spike detection
 
-	if z > m.Threshold {
+	// 4. Behavioral anomaly check — score based on path diversity, not raw volume.
+	// Normal users browsing diverse pages score ~0. Floods hitting one endpoint score ~0.8+.
+	score := m.tracker.Score(addr)
+	if score > m.Threshold {
 		ttl := m.calcTTL(addr)
-		m.jail.Add(addr, ttl, "auto:z-score", m.infractionCount(addr))
-		m.setVars(r, "jailed", addr, z)
-		m.logger.Info("auto-jailed IP",
+		m.jail.Add(addr, ttl, "auto:behavioral", m.infractionCount(addr))
+		m.setVars(r, "jailed", addr, score)
+		m.logger.Info("auto-jailed IP (behavioral)",
 			zap.String("ip", addr.String()),
-			zap.Float64("z_score", z),
+			zap.Float64("anomaly_score", score),
+			zap.Float64("threshold", m.Threshold),
 			zap.Duration("ttl", ttl),
 			zap.String("fingerprint", fpHex(fp)))
 		w.WriteHeader(http.StatusForbidden)
 		return nil
 	}
 
-	// 4. Pass through
-	m.setVars(r, "pass", addr, z)
+	// 5. Pass through
+	m.setVars(r, "pass", addr, score)
 	return next.ServeHTTP(w, r)
 }
 
