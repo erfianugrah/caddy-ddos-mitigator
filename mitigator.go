@@ -334,13 +334,13 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 	// 1. Whitelist check
 	if m.whitelist.Contains(addr) {
-		m.setVars(r, "pass", addr, 0)
+		m.setVars(r, "pass", addr, 0, "")
 		return next.ServeHTTP(w, r)
 	}
 
 	// 2. Jail check — RLock on one of 64 shards
 	if m.jail.IsJailed(addr) || m.cidr.IsPromoted(addr) {
-		m.setVars(r, "blocked", addr, 0)
+		m.setVars(r, "blocked", addr, 0, "")
 		w.WriteHeader(http.StatusForbidden)
 		return nil
 	}
@@ -358,7 +358,7 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	if score > m.Threshold {
 		ttl := m.calcTTL(addr)
 		m.jail.Add(addr, ttl, "auto:behavioral", m.infractionCount(addr))
-		m.setVars(r, "jailed", addr, score)
+		m.setVars(r, "jailed", addr, score, fpHex(fp))
 		m.logger.Info("auto-jailed IP (behavioral)",
 			zap.String("ip", addr.String()),
 			zap.Float64("anomaly_score", score),
@@ -378,7 +378,7 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	}
 
 	// 5. Pass through
-	m.setVars(r, "pass", addr, score)
+	m.setVars(r, "pass", addr, score, fpHex(fp))
 	return next.ServeHTTP(w, r)
 }
 
@@ -414,11 +414,14 @@ func (m *DDOSMitigator) infractionCount(addr netip.Addr) int32 {
 
 // ─── Log Variables ──────────────────────────────────────────────────
 
-func (m *DDOSMitigator) setVars(r *http.Request, action string, addr netip.Addr, zScore float64) {
+func (m *DDOSMitigator) setVars(r *http.Request, action string, addr netip.Addr, zScore float64, fingerprint string) {
 	caddyhttp.SetVar(r.Context(), "ddos_mitigator.action", action)
 	caddyhttp.SetVar(r.Context(), "ddos_mitigator.ip", addr.String())
 	caddyhttp.SetVar(r.Context(), "ddos_mitigator.z_score", fmt.Sprintf("%.2f", zScore))
 	caddyhttp.SetVar(r.Context(), "ddos_mitigator.spike_mode", fmt.Sprintf("%t", m.stats.IsSpikeMode()))
+	if fingerprint != "" {
+		caddyhttp.SetVar(r.Context(), "ddos_mitigator.fingerprint", fingerprint)
+	}
 }
 
 // ─── Client IP Extraction ───────────────────────────────────────────
