@@ -270,20 +270,20 @@ go generate ./...
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `mitigator.go` | 726 | L7 handler, Caddy lifecycle, Caddyfile parsing |
+| `mitigator.go` | 745 | L7 handler, Caddy lifecycle, Caddyfile parsing |
 | `nftables.go` | 286 | Kernel ipset management via google/nftables |
-| `profile.go` | 266 | Per-IP behavioral profiling + anomaly scoring |
+| `profile.go` | 275 | Per-IP behavioral profiling + anomaly scoring |
 | `xdp.go` | 244 | eBPF/XDP loader via cilium/ebpf |
 | `jail.go` | 209 | 64-shard concurrent map, TTL, sweep, registry |
-| `util.go` | 172 | Whitelist, atomicWriteFile, jail file I/O |
 | `stats.go` | 173 | Welford + dual EWMA, z-score, spike detection |
+| `util.go` | 172 | Whitelist, atomicWriteFile, jail file I/O |
 | `mitigator_l4.go` | 163 | L4 TCP RST handler, forceDrop |
 | `cidr.go` | 133 | CIDR prefix aggregation |
 | `cms.go` | 118 | Count-Min Sketch, atomic, decay |
 | `fingerprint.go` | 98 | 5 strategies, path normalization |
 | `bpf/xdp_drop.c` | 106 | XDP eBPF C program |
-| **Total production** | ~2900 | |
-| **Total tests** | ~2300 | 116 tests, 4 benchmarks |
+| **Total production** | ~3100 | |
+| **Total tests** | ~2150 | 116 tests, 4 benchmarks |
 
 ## License
 
