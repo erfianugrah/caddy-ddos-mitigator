@@ -118,8 +118,13 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 		m.CMSDepth = 4
 	}
 
-	// Initialize domain objects
-	m.jail = newIPJail()
+	// Initialize domain objects.
+	// Use the jail registry so L4 handlers can share the same jail.
+	if m.JailFile != "" {
+		m.jail = getOrCreateJail(m.JailFile)
+	} else {
+		m.jail = newIPJail()
+	}
 	m.cms = newCountMinSketch(m.CMSDepth, m.CMSWidth)
 	m.stats = newAdaptiveStats()
 	m.whitelist = newWhitelist(m.WhitelistCIDRs)

@@ -176,3 +176,34 @@ func (j *ipJail) Snapshot() map[netip.Addr]jailEntry {
 	}
 	return result
 }
+
+// ─── Jail Registry (shared between L7 and L4 modules) ──────────────
+
+// jailRegistry maps jail file paths to shared ipJail instances.
+// When an L7 handler provisions with a jail_file, it registers its jail here.
+// The L4 handler looks it up by the same path during its own Provision.
+var (
+	jailRegistryMu sync.Mutex
+	jailRegistry   = map[string]*ipJail{}
+)
+
+// getOrCreateJail returns the shared jail for a jail file path.
+// If no jail exists for that path, it creates one. Thread-safe.
+func getOrCreateJail(jailFile string) *ipJail {
+	jailRegistryMu.Lock()
+	defer jailRegistryMu.Unlock()
+
+	if j, ok := jailRegistry[jailFile]; ok {
+		return j
+	}
+	j := newIPJail()
+	jailRegistry[jailFile] = j
+	return j
+}
+
+// getJail returns the shared jail for a jail file path, or nil if none exists.
+func getJail(jailFile string) *ipJail {
+	jailRegistryMu.Lock()
+	defer jailRegistryMu.Unlock()
+	return jailRegistry[jailFile]
+}
