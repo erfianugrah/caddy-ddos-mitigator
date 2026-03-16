@@ -36,7 +36,7 @@ func validateJailPath(path string) error {
 // of fn. This coordinates jail file access between the plugin and wafctl.
 func withFileLock(path string, fn func() error) error {
 	lockPath := path + ".lock"
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return fmt.Errorf("open lock file: %w", err)
 	}
