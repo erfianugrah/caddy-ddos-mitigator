@@ -285,6 +285,21 @@ go generate ./...
 | **Total production** | ~3100 | |
 | **Total tests** | ~2150 | 116 tests, 4 benchmarks |
 
+## Security
+
+v0.8.2 includes a comprehensive security audit (March 2026) with 21 fixes:
+- IPv4-mapped IPv6 jail bypass fixed (Unmap on all paths)
+- 64-shard IP tracker with per-shard LRU eviction (O(1) instead of O(N))
+- CIDR prefix counters (O(1) check instead of O(N) snapshot)
+- CMS seeds from crypto/rand (not deterministic)
+- Jail file: symlink validation, absolute path check, flock coordination
+- XDP: loopback interface rejection, diff-based sync (O(delta) not O(N))
+- nftables: auto-reconnection on failure
+- Path normalization: URL decode + configurable depth truncation
+- Whitelist validation rejects invalid CIDRs at Provision time
+- Numeric config validation prevents panics on bad values
+- Proper error pages via caddyhttp.Error (not bare WriteHeader)
+
 ## License
 
 [MIT](LICENSE)
