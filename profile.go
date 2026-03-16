@@ -227,6 +227,15 @@ func (t *ipTracker) Score(ip netip.Addr) float64 {
 	return p.AnomalyScore()
 }
 
+// Reset removes the behavioral profile for an IP, allowing it to be
+// re-evaluated from scratch. Called when an IP is manually unjailed via
+// the wafctl API to prevent immediate re-jail from stale profile data.
+func (t *ipTracker) Reset(ip netip.Addr) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.profiles, ip)
+}
+
 // Count returns the number of tracked IPs.
 func (t *ipTracker) Count() int {
 	t.mu.RLock()

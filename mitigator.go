@@ -490,10 +490,25 @@ func (m *DDOSMitigator) runFileSync(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// Snapshot current jail before reading file
+			beforeSync := m.jail.Snapshot()
+
 			// Read new entries from file (written by wafctl)
 			if err := readJailFile(m.JailFile, m.jail); err != nil {
 				m.logger.Warn("jail file read error", zap.Error(err))
 			}
+
+			// Check for IPs that were manually unjailed via wafctl API:
+			// if an IP was in the jail before sync but is no longer jailed,
+			// clear its behavioral profile so it won't be immediately re-jailed.
+			for addr := range beforeSync {
+				if !m.jail.IsJailed(addr) {
+					m.tracker.Reset(addr)
+					m.logger.Info("cleared behavioral profile for unjailed IP",
+						zap.String("ip", addr.String()))
+				}
+			}
+
 			// Write current jail state to file (for wafctl to read)
 			if err := writeJailFile(m.JailFile, m.jail); err != nil {
 				m.logger.Warn("jail file write error", zap.Error(err))
