@@ -37,6 +37,8 @@
 
 ## 1. CRITICAL: IPv4-Mapped IPv6 Jail Bypass in L7 Handler
 
+**Status: FIXED** — `.Unmap()` added to both return paths in `clientAddr()`.
+
 **Files:** `mitigator.go:431-451`, `mitigator_l4.go:136-155`, `jail.go:54-59`
 
 **Problem:**
@@ -103,6 +105,8 @@ func clientAddr(r *http.Request) (netip.Addr, bool) {
 
 ## 2. CRITICAL: Fingerprint Hash Not Collision-Resistant
 
+**Status: OPEN** — Deferred pending CMS retention decision (#10).
+
 **Files:** `fingerprint.go:36-69`, `cms.go:42-46`, `cms.go:52-59`
 
 **Problem:**
@@ -168,6 +172,8 @@ remove it entirely and reclaim 256KB of memory + per-request hash computation.
 ---
 
 ## 3. CRITICAL: Jail File Symlink Race and Permission Issues
+
+**Status: PARTIALLY FIXED** — Symlink validation + absolute path check added in Provision. Permissions tightened to 0660. HMAC not added (requires cross-repo coordination).
 
 **Files:** `util.go:53-83`, `util.go:104-125`, `util.go:131-171`
 
@@ -240,6 +246,8 @@ shared secret between the plugin and wafctl.
 
 ## 4. HIGH: ipTracker Single Global Mutex Bottleneck
 
+**Status: OPEN** — Architectural change (sharding). Deferred.
+
 **Files:** `profile.go:173-176`, `profile.go:189-203`
 
 **Problem:**
@@ -311,6 +319,8 @@ to pass.
 
 ## 5. HIGH: CIDR Check Takes O(N) Snapshot on Hot Path
 
+**Status: OPEN** — Requires prefix counter wiring into jail Add/Remove/Sweep. Deferred.
+
 **Files:** `cidr.go:70`, called from `mitigator.go:370`
 
 **Problem:**
@@ -375,6 +385,8 @@ func (c *cidrAggregator) Check(addr netip.Addr, ttl time.Duration) *netip.Prefix
 
 ## 6. HIGH: O(N) Profile Eviction Under Write Lock
 
+**Status: OPEN** — Pairs with #4 (sharding). Deferred.
+
 **Files:** `profile.go:263-274`
 
 **Problem:**
@@ -409,6 +421,8 @@ On eviction: remove from the front of the list (least recently used). Both O(1).
 ---
 
 ## 7. HIGH: No xdp_iface Validation
+
+**Status: FIXED** — Loopback interface rejected in xdp Setup().
 
 **Files:** `mitigator.go:218-235`, `xdp.go:85-120`
 
@@ -465,6 +479,8 @@ func (x *xdpReal) Setup() error {
 ---
 
 ## 8. MEDIUM: Path Diversity Evasion via Random Suffixes
+
+**Status: PARTIALLY FIXED** — URL decoding added to normalizePath (short-term fix). Path depth config deferred.
 
 **Files:** `fingerprint.go:76-91`, `profile.go:55-71`
 
@@ -547,6 +563,8 @@ at configurable depth, not per exact path.
 
 ## 9. MEDIUM: Low-and-Slow Attacks Bypass Detection Entirely
 
+**Status: OPEN** — Inherent to behavioral profiling design. Documentation recommended.
+
 **Files:** `profile.go:138-168`
 
 **Problem:**
@@ -592,6 +610,8 @@ correlation is a significant feature.
 ---
 
 ## 10. MEDIUM: User-Agent Rotation Defeats CMS / CMS Appears Vestigial
+
+**Status: OPEN** — Architectural decision needed (remove vs. retain as secondary signal).
 
 **Files:** `fingerprint.go:41-44`, `mitigator.go:350-353`
 
@@ -649,6 +669,8 @@ Coordinate the variable rename with wafctl if going with Option A.
 
 ## 11. MEDIUM: CMS Decay is Not Atomic
 
+**Status: FIXED** — Decay() uses CompareAndSwap retry loop instead of Load/Store.
+
 **Files:** `cms.go:99-109`
 
 **Problem:**
@@ -698,6 +720,8 @@ func (cms *countMinSketch) Decay(factor float64) {
 ---
 
 ## 12. MEDIUM: Jail Registry Leaks Memory on Caddy Reload
+
+**Status: FIXED** — Reference counting via jailRegistryEntry; releaseJail() called from Cleanup().
 
 **Files:** `jail.go:185-202`
 
@@ -769,6 +793,8 @@ Call `releaseJail` from `Cleanup()`.
 
 ## 13. MEDIUM: No nftables Reconnection on Failure
 
+**Status: OPEN** — Requires refactoring Setup into lock-free inner method. Deferred.
+
 **Files:** `nftables.go:200-246`
 
 **Problem:**
@@ -838,6 +864,8 @@ consecutive failures.
 
 ## 14. MEDIUM: XDP Sync O(N) Flush Per Cycle
 
+**Status: OPEN** — Requires userspace tracking of BPF map state. Deferred.
+
 **Files:** `xdp.go:122-181`
 
 **Problem:**
@@ -900,6 +928,8 @@ steady state with few changes, this is nearly zero syscalls per cycle.
 ---
 
 ## 15. MEDIUM: Bidirectional Jail File Race Between Plugin and wafctl
+
+**Status: OPEN** — Requires coordinated flock change with wafctl. Deferred.
 
 **Files:** `util.go:104-171`, `mitigator.go:485-518`
 
@@ -971,6 +1001,8 @@ use the same lock file (`jail.json.lock`).
 
 ## 16. LOW: Jail File Permissions Too Permissive
 
+**Status: FIXED** — Permissions changed from 0644 to 0660.
+
 **Files:** `util.go:125`
 
 **Problem:**
@@ -1008,6 +1040,8 @@ And in `caddy-compose`, ensure both containers share a GID.
 ---
 
 ## 17. LOW: Unconditional Disk I/O on Sync Interval
+
+**Status: FIXED** — dirty atomic.Bool flag added to ipJail; file write skipped when jail unchanged.
 
 **Files:** `mitigator.go:485-518`
 
@@ -1064,6 +1098,8 @@ if info.ModTime().Equal(m.lastFileMtime) {
 
 ## 18. LOW: Status Code Always Zero / StatusEntropy Dead Signal
 
+**Status: OPEN** — Dead code. Deferred.
+
 **Files:** `mitigator.go:349`, `profile.go:55-71`, `profile.go:96-113`
 
 **Problem:**
@@ -1113,6 +1149,8 @@ func (s *statusCapture) WriteHeader(code int) {
 ---
 
 ## 19. LOW: Whitelist Silently Ignores Invalid CIDRs
+
+**Status: FIXED** — newWhitelist() returns error on invalid CIDRs; Provision propagates the error.
 
 **Files:** `util.go:26-36`
 
@@ -1177,6 +1215,8 @@ m.whitelist = wl
 
 ## 20. LOW: Missing Validation on Numeric Config Values
 
+**Status: FIXED** — Validate() checks CMSWidth, CMSDepth, CIDRThresholdV4/V6, ProfileMaxIPs > 0 and WarmupRequests >= 0.
+
 **Files:** `mitigator.go:282-297`
 
 **Problem:**
@@ -1225,6 +1265,8 @@ func (m *DDOSMitigator) Validate() error {
 ---
 
 ## 21. LOW: Unused addrToNetIP Helper
+
+**Status: FIXED** — Dead code removed.
 
 **Files:** `nftables.go:279-286`
 
@@ -1297,26 +1339,26 @@ Credit where due -- things done well:
 
 Recommended order based on impact-to-effort ratio:
 
-| Priority | Issue | Effort | Impact |
-|----------|-------|--------|--------|
-| 1 | [#1 IPv4-mapped-v6 bypass](#1-critical-ipv4-mapped-ipv6-jail-bypass-in-l7-handler) | 5 min | Closes a real evasion vector |
-| 2 | [#19 Whitelist validation](#19-low-whitelist-silently-ignores-invalid-cidrs) | 10 min | Prevents operator misconfiguration |
-| 3 | [#20 Numeric config validation](#20-low-missing-validation-on-numeric-config-values) | 10 min | Prevents panics on bad config |
-| 4 | [#7 xdp_iface validation](#7-high-no-xdp_iface-validation) | 10 min | Prevents operational misuse |
-| 5 | [#21 Dead code removal](#21-low-unused-addrtonetip-helper) | 2 min | Cleanup |
-| 6 | [#15 Jail file flock](#15-medium-bidirectional-jail-file-race-between-plugin-and-wafctl) | 1 hour | Fixes wafctl integration race |
-| 7 | [#4 Shard the tracker](#4-high-iptracker-single-global-mutex-bottleneck) | 2 hours | Biggest perf improvement |
-| 8 | [#6 LRU eviction](#6-high-on-profile-eviction-under-write-lock) | 2 hours | Eliminates O(N) stalls |
-| 9 | [#5 CIDR prefix counters](#5-high-cidr-check-takes-on-snapshot-on-hot-path) | 2 hours | Hot path perf |
-| 10 | [#8 Path normalization](#8-medium-path-diversity-evasion-via-random-suffixes) | 1 hour | Closes evasion technique |
-| 11 | [#12 Jail registry refcount](#12-medium-jail-registry-leaks-memory-on-caddy-reload) | 30 min | Memory hygiene |
-| 12 | [#10 CMS decision](#10-medium-user-agent-rotation-defeats-cms--cms-appears-vestigial) | 1 hour | Architectural clarity |
-| 13 | [#13 nftables reconnect](#13-medium-no-nftables-reconnection-on-failure) | 1 hour | Reliability |
-| 14 | [#14 XDP diff sync](#14-medium-xdp-sync-on-flush-per-cycle) | 2 hours | Large jail perf |
-| 15 | [#3 Jail file hardening](#3-critical-jail-file-symlink-race-and-permission-issues) | 2 hours | Defense in depth |
-| 16 | [#2 CMS hash seeds](#2-critical-fingerprint-hash-not-collision-resistant) | 30 min | If CMS retained |
-| 17 | [#17 Dirty-flag sync](#17-low-unconditional-disk-io-on-sync-interval) | 30 min | Disk I/O reduction |
-| 18 | [#18 Status code capture](#18-low-status-code-always-zero--statusentropy-dead-signal) | 30 min | Dead code or new signal |
-| 19 | [#11 CMS atomic decay](#11-medium-cms-decay-is-not-atomic) | 15 min | If CMS retained |
-| 20 | [#16 File permissions](#16-low-jail-file-permissions-too-permissive) | 5 min | Coord with wafctl |
-| 21 | [#9 Low-and-slow documentation](#9-medium-low-and-slow-attacks-bypass-detection-entirely) | 30 min | Documentation |
+| Priority | Issue | Effort | Impact | Status |
+|----------|-------|--------|--------|--------|
+| 1 | [#1 IPv4-mapped-v6 bypass](#1-critical-ipv4-mapped-ipv6-jail-bypass-in-l7-handler) | 5 min | Closes a real evasion vector | ✅ FIXED |
+| 2 | [#19 Whitelist validation](#19-low-whitelist-silently-ignores-invalid-cidrs) | 10 min | Prevents operator misconfiguration | ✅ FIXED |
+| 3 | [#20 Numeric config validation](#20-low-missing-validation-on-numeric-config-values) | 10 min | Prevents panics on bad config | ✅ FIXED |
+| 4 | [#7 xdp_iface validation](#7-high-no-xdp_iface-validation) | 10 min | Prevents operational misuse | ✅ FIXED |
+| 5 | [#21 Dead code removal](#21-low-unused-addrtonetip-helper) | 2 min | Cleanup | ✅ FIXED |
+| 6 | [#15 Jail file flock](#15-medium-bidirectional-jail-file-race-between-plugin-and-wafctl) | 1 hour | Fixes wafctl integration race | OPEN |
+| 7 | [#4 Shard the tracker](#4-high-iptracker-single-global-mutex-bottleneck) | 2 hours | Biggest perf improvement | OPEN |
+| 8 | [#6 LRU eviction](#6-high-on-profile-eviction-under-write-lock) | 2 hours | Eliminates O(N) stalls | OPEN |
+| 9 | [#5 CIDR prefix counters](#5-high-cidr-check-takes-on-snapshot-on-hot-path) | 2 hours | Hot path perf | OPEN |
+| 10 | [#8 Path normalization](#8-medium-path-diversity-evasion-via-random-suffixes) | 1 hour | Closes evasion technique | ✅ FIXED |
+| 11 | [#12 Jail registry refcount](#12-medium-jail-registry-leaks-memory-on-caddy-reload) | 30 min | Memory hygiene | ✅ FIXED |
+| 12 | [#10 CMS decision](#10-medium-user-agent-rotation-defeats-cms--cms-appears-vestigial) | 1 hour | Architectural clarity | OPEN |
+| 13 | [#13 nftables reconnect](#13-medium-no-nftables-reconnection-on-failure) | 1 hour | Reliability | OPEN |
+| 14 | [#14 XDP diff sync](#14-medium-xdp-sync-on-flush-per-cycle) | 2 hours | Large jail perf | OPEN |
+| 15 | [#3 Jail file hardening](#3-critical-jail-file-symlink-race-and-permission-issues) | 2 hours | Defense in depth | ✅ Partial |
+| 16 | [#2 CMS hash seeds](#2-critical-fingerprint-hash-not-collision-resistant) | 30 min | If CMS retained | OPEN |
+| 17 | [#17 Dirty-flag sync](#17-low-unconditional-disk-io-on-sync-interval) | 30 min | Disk I/O reduction | ✅ FIXED |
+| 18 | [#18 Status code capture](#18-low-status-code-always-zero--statusentropy-dead-signal) | 30 min | Dead code or new signal | OPEN |
+| 19 | [#11 CMS atomic decay](#11-medium-cms-decay-is-not-atomic) | 15 min | If CMS retained | ✅ FIXED |
+| 20 | [#16 File permissions](#16-low-jail-file-permissions-too-permissive) | 5 min | Coord with wafctl | ✅ FIXED |
+| 21 | [#9 Low-and-slow documentation](#9-medium-low-and-slow-attacks-bypass-detection-entirely) | 30 min | Documentation | OPEN |
