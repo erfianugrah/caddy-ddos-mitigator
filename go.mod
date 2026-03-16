@@ -4,6 +4,7 @@ go 1.26.1
 
 require (
 	github.com/caddyserver/caddy/v2 v2.11.1
+	github.com/google/nftables v0.3.0
 	github.com/mholt/caddy-l4 v0.1.0
 	go.uber.org/zap v1.27.1
 )
@@ -47,6 +48,7 @@ require (
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/cel-go v0.27.0 // indirect
+	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.11 // indirect
@@ -63,6 +65,8 @@ require (
 	github.com/manifoldco/promptui v0.9.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
+	github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42 // indirect
+	github.com/mdlayher/socket v0.5.0 // indirect
 	github.com/mgutz/ansi v0.0.0-20200706080929-d51e80ef957d // indirect
 	github.com/mholt/acmez/v3 v3.1.6 // indirect
 	github.com/miekg/dns v1.1.72 // indirect

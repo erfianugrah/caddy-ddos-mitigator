@@ -67,12 +67,20 @@ type DDOSMitigator struct {
 	// WhitelistCIDRs are CIDR prefixes that bypass all jail checks.
 	WhitelistCIDRs []string `json:"whitelist,omitempty"`
 
+	// KernelDrop enables nftables ipset-based kernel-level packet dropping.
+	// Requires NET_ADMIN capability. Disabled by default.
+	KernelDrop bool `json:"kernel_drop,omitempty"`
+
+	// NftSyncInterval is how often the nftables ipset is synced with the jail.
+	NftSyncInterval caddy.Duration `json:"nft_sync_interval,omitempty"`
+
 	// --- Internal state ---
 
 	jail      *ipJail
 	cms       *countMinSketch
 	stats     *adaptiveStats
 	whitelist *whitelist
+	nft       nftManager
 	strategy  atomic.Int32 // current fingerprintStrategy
 	logger    *zap.Logger
 	cancel    context.CancelFunc
@@ -130,6 +138,29 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 	m.whitelist = newWhitelist(m.WhitelistCIDRs)
 	m.strategy.Store(int32(fpFull))
 
+	if m.NftSyncInterval == 0 {
+		m.NftSyncInterval = caddy.Duration(2 * time.Second)
+	}
+
+	// Initialize nftables if kernel_drop is enabled.
+	if m.KernelDrop {
+		mgr := newNftManager(m.logger)
+		if mgr.Available() {
+			if err := mgr.Setup(); err != nil {
+				m.logger.Error("nftables setup failed, falling back to userspace-only",
+					zap.Error(err))
+				m.nft = nftNoop{}
+			} else {
+				m.nft = mgr
+			}
+		} else {
+			m.logger.Warn("kernel_drop enabled but NET_ADMIN not available, falling back to userspace-only")
+			m.nft = nftNoop{}
+		}
+	} else {
+		m.nft = nftNoop{}
+	}
+
 	// Load jail file if configured
 	if m.JailFile != "" {
 		if err := readJailFile(m.JailFile, m.jail); err != nil {
@@ -151,13 +182,17 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 	if m.JailFile != "" {
 		go m.runFileSync(bgCtx)
 	}
+	if m.KernelDrop {
+		go m.runNftSync(bgCtx)
+	}
 
 	m.logger.Info("ddos_mitigator provisioned",
 		zap.Float64("threshold", m.Threshold),
 		zap.Duration("base_penalty", time.Duration(m.BasePenalty)),
 		zap.Int("cms_width", m.CMSWidth),
 		zap.Int("cms_depth", m.CMSDepth),
-		zap.Int("whitelist_prefixes", len(m.whitelist.prefixes)))
+		zap.Int("whitelist_prefixes", len(m.whitelist.prefixes)),
+		zap.Bool("kernel_drop", m.KernelDrop))
 
 	return nil
 }
@@ -186,6 +221,12 @@ func (m *DDOSMitigator) Validate() error {
 func (m *DDOSMitigator) Cleanup() error {
 	if m.cancel != nil {
 		m.cancel()
+	}
+	// Clean up nftables rules/sets (no stale kernel state)
+	if m.nft != nil {
+		if err := m.nft.Cleanup(); err != nil {
+			m.logger.Error("nftables cleanup error", zap.Error(err))
+		}
 	}
 	// Write final jail state
 	if m.JailFile != "" && m.jail != nil {
@@ -360,6 +401,22 @@ func (m *DDOSMitigator) runFileSync(ctx context.Context) {
 	}
 }
 
+func (m *DDOSMitigator) runNftSync(ctx context.Context) {
+	ticker := time.NewTicker(time.Duration(m.NftSyncInterval))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			snap := m.jail.Snapshot()
+			if err := m.nft.SyncJail(snap); err != nil {
+				m.logger.Warn("nftables sync error", zap.Error(err))
+			}
+		}
+	}
+}
+
 // ─── Caddyfile Parsing ──────────────────────────────────────────────
 
 func (m *DDOSMitigator) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
@@ -449,6 +506,21 @@ func (m *DDOSMitigator) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if len(m.WhitelistCIDRs) == 0 {
 				return d.ArgErr()
 			}
+		case "kernel_drop":
+			if d.NextArg() {
+				m.KernelDrop = d.Val() == "true" || d.Val() == "on"
+			} else {
+				m.KernelDrop = true
+			}
+		case "nft_sync_interval":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("invalid nft_sync_interval: %v", err)
+			}
+			m.NftSyncInterval = caddy.Duration(dur)
 		default:
 			return d.Errf("unknown ddos_mitigator directive: %s", d.Val())
 		}
