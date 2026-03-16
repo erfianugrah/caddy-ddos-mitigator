@@ -156,7 +156,7 @@ func writeJailFile(path string, j *ipJail) error {
 	if err != nil {
 		return fmt.Errorf("marshal jail file: %w", err)
 	}
-	return atomicWriteFile(path, data, 0660)
+	return atomicWriteFile(path, data, 0664)
 }
 
 // readJailFile reads a jail file and merges its entries into the jail.
