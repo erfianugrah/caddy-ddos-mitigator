@@ -97,6 +97,13 @@ func (n *nftReal) Setup() error {
 		return fmt.Errorf("nftables connection not initialized")
 	}
 
+	// Delete existing table if present (prevents duplicate rules on hot-reload).
+	n.conn.DelTable(&nftables.Table{
+		Family: nftables.TableFamilyINet,
+		Name:   nftTableName,
+	})
+	n.conn.Flush() // ignore error — table may not exist yet
+
 	// Create table: inet ddos_mitigator
 	n.table = n.conn.AddTable(&nftables.Table{
 		Family: nftables.TableFamilyINet,

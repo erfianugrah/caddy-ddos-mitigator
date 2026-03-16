@@ -30,12 +30,9 @@ const (
 	// When stddev is below this, deviations from mean get a high z-score.
 	minStdDev = 1e-9
 
-	// Minimum number of observations before z-score becomes actionable.
-	// Until the stats engine has seen enough diverse traffic to build a
-	// meaningful baseline, ZScore() returns 0 (no auto-jail). This prevents
-	// false positives during startup and low-traffic periods where a single
-	// user browsing normally would appear anomalous against a near-zero mean.
-	minObservationsForZScore = 1000
+	// Default minimum observations before z-score becomes actionable.
+	// Configurable via DDOSMitigator.WarmupRequests.
+	defaultMinObservationsForZScore = 1000
 )
 
 // ─── Types ──────────────────────────────────────────────────────────
@@ -54,12 +51,19 @@ type adaptiveStats struct {
 	ewmaFast    float64
 	ewmaSlow    float64
 	ewmaStarted bool
+
+	// Configurable warmup threshold
+	minObservations int64
 }
 
 // ─── Constructor ────────────────────────────────────────────────────
 
 func newAdaptiveStats() *adaptiveStats {
-	return &adaptiveStats{}
+	return &adaptiveStats{minObservations: defaultMinObservationsForZScore}
+}
+
+func newAdaptiveStatsWithWarmup(minObs int) *adaptiveStats {
+	return &adaptiveStats{minObservations: int64(minObs)}
 }
 
 // ─── Observe ────────────────────────────────────────────────────────
@@ -125,7 +129,7 @@ func (s *adaptiveStats) ZScore(x float64) float64 {
 	// Don't produce actionable z-scores until we have a real baseline.
 	// With too few observations, the mean and variance are meaningless —
 	// a single user browsing normally looks anomalous against near-zero stats.
-	if s.count < minObservationsForZScore {
+	if s.count < s.minObservations {
 		return 0
 	}
 

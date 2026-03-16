@@ -1,0 +1,290 @@
+# caddy-ddos-mitigator
+
+Adaptive DDoS/DoS mitigation plugin for [Caddy](https://caddyserver.com/). Behavioral IP profiling with multi-layer enforcement: L7 HTTP block, L4 TCP RST, kernel nftables drop, and eBPF/XDP NIC-level drop.
+
+## How It Works
+
+The plugin evaluates each request's **behavioral profile** — not just raw volume. A single user browsing 200 pages scores 0.00 (normal). A bot hitting one endpoint 500 times scores 0.85 (flood). This prevents the false positives that pure rate-limiting produces.
+
+**Detection signals:**
+- **Path diversity** — unique paths / total requests. Users browse many pages; bots hammer one.
+- **Volume confidence** — low request counts are dampened (not enough data to judge).
+- **Rate amplification** — high req/s with low diversity is more suspicious than slow monotone traffic.
+
+**Enforcement layers (fastest to slowest):**
+
+| Layer | Mechanism | Throughput | Config |
+|-------|-----------|-----------|--------|
+| eBPF/XDP | `XDP_DROP` at NIC driver | ~10M pps | `xdp_drop`, `xdp_iface` |
+| nftables | Kernel ipset drop | ~1.5M pps | `kernel_drop` |
+| L4 TCP | `SetLinger(0)` → RST | ~100K conn/s | L4 handler (caddy-l4) |
+| L7 HTTP | 403 Forbidden | ~50K req/s | L7 handler (default) |
+
+All layers share the same IP jail. When a request triggers the behavioral threshold, the IP is jailed and immediately blocked at all active layers.
+
+## Installation
+
+```bash
+xcaddy build \
+    --with github.com/erfianugrah/caddy-ddos-mitigator@latest \
+    --with github.com/mholt/caddy-l4  # optional, for L4 TCP RST
+```
+
+## Caddyfile
+
+```caddyfile
+{
+    order ddos_mitigator first
+}
+
+example.com {
+    ddos_mitigator {
+        # Core detection
+        jail_file         /data/waf/jail.json
+        threshold         0.65          # behavioral anomaly score (0.0–1.0)
+        base_penalty      60s           # first offense jail duration
+        max_penalty       24h           # cap for exponential backoff
+        warmup_requests   1000          # min observations before z-score activates
+
+        # Behavioral profiling
+        profile_ttl       10m           # how long IP profiles are retained
+        profile_max_ips   100000        # max tracked IPs (LRU eviction)
+
+        # CIDR aggregation
+        cidr_threshold_v4 5             # jail /24 when 5+ IPs from same subnet
+        cidr_threshold_v6 5             # jail /64 when 5+ IPv6 from same prefix
+
+        # Count-Min Sketch (fingerprint frequency tracking)
+        cms_width         8192          # matrix width (memory: depth × width × 8 bytes)
+        cms_depth         4             # hash functions (higher = fewer collisions)
+
+        # Background intervals
+        sweep_interval    10s           # expired jail entry cleanup
+        decay_interval    30s           # CMS counter halving
+        sync_interval     5s            # jail file read/write with wafctl
+
+        # Kernel-level drop (requires NET_ADMIN capability)
+        kernel_drop       true
+        nft_sync_interval 2s
+
+        # eBPF/XDP (requires BPF + NET_ADMIN capabilities)
+        # xdp_drop        true
+        # xdp_iface       eth0
+        # xdp_sync_interval 2s
+
+        # Whitelist (never jail these CIDRs)
+        whitelist         192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 127.0.0.0/8 ::1/128
+    }
+
+    reverse_proxy upstream:8080
+}
+```
+
+## JSON Configuration
+
+All Caddyfile directives map to JSON fields on the `http.handlers.ddos_mitigator` module:
+
+```json
+{
+    "handler": "ddos_mitigator",
+    "jail_file": "/data/waf/jail.json",
+    "threshold": 0.65,
+    "base_penalty": "60s",
+    "max_penalty": "24h",
+    "warmup_requests": 1000,
+    "profile_ttl": "10m",
+    "profile_max_ips": 100000,
+    "cidr_threshold_v4": 5,
+    "cidr_threshold_v6": 5,
+    "cms_width": 8192,
+    "cms_depth": 4,
+    "sweep_interval": "10s",
+    "decay_interval": "30s",
+    "sync_interval": "5s",
+    "kernel_drop": true,
+    "nft_sync_interval": "2s",
+    "whitelist": ["192.168.0.0/16", "10.0.0.0/8"]
+}
+```
+
+## L4 Handler (TCP RST)
+
+Requires [caddy-l4](https://github.com/mholt/caddy-l4). Drops jailed IPs at the TCP level before TLS handshake, via `SetLinger(0)` which sends a RST and bypasses TIME_WAIT state accumulation.
+
+```json
+{
+    "apps": {
+        "layer4": {
+            "servers": {
+                "tcp_guard": {
+                    "listen": [":443"],
+                    "routes": [{
+                        "handle": [
+                            {"handler": "ddos_mitigator", "jail_file": "/data/waf/jail.json"},
+                            {"handler": "tls"},
+                            {"handler": "proxy", "upstreams": [{"dial": ["127.0.0.1:8443"]}]}
+                        ]
+                    }]
+                }
+            }
+        }
+    }
+}
+```
+
+The L4 and L7 modules share the same jail via a package-level registry keyed by `jail_file` path.
+
+## Architecture
+
+```
+                   ┌─────────────────────────────────────────────────┐
+                   │             caddy-ddos-mitigator                │
+ TCP connection ──►│                                                 │
+                   │  eBPF/XDP: BPF map lookup → XDP_DROP            │
+                   │  nftables: ipset lookup → kernel drop           │
+                   │  L4 handler: jail check → SetLinger(0) + RST    │
+                   │  L7 handler:                                    │
+                   │    ├─ whitelist? → pass                         │
+                   │    ├─ jailed or CIDR promoted? → 403            │
+                   │    ├─ tracker.Record(ip, method, path, ua)      │
+                   │    ├─ profile.AnomalyScore() > threshold? → jail│
+                   │    └─ pass → next handler (WAF, proxy)          │
+                   └─────────────────────────────────────────────────┘
+                              │
+                   jail.json  │  Caddy log fields
+                   (file)     │  (ddos_action, ddos_fingerprint, ...)
+                              ▼
+                          wafctl sidecar
+                   (spike detection, forensics, dashboard, jail API)
+```
+
+## Behavioral Scoring
+
+The `AnomalyScore()` function computes a 0.0–1.0 score per IP:
+
+| Scenario | Path Diversity | Volume | Score |
+|----------|---------------|--------|-------|
+| Normal browsing (16 pages) | 1.00 | 16 | 0.00 |
+| Power user (200 reqs, 20 pages) | 0.10 | 200 | 0.00 |
+| Crawler (100 unique pages) | 1.00 | 100 | 0.00 |
+| Slow flood (50 reqs, 1 page) | 0.02 | 50 | 0.20 |
+| Flood (500 reqs, 1 page) | 0.002 | 500 | 0.85 |
+| Monotone flood (300 reqs, 1 page) | 0.003 | 300 | 0.71 |
+
+The scoring uses exponential decay on path diversity (`exp(-pathDiv × 80)`) modulated by volume confidence and rate amplification. All parameters are tuned to ensure normal users never reach the default threshold (0.65) regardless of browsing intensity.
+
+## Penalty Escalation
+
+Jailed IPs receive exponential backoff with ±25% jitter:
+
+```
+TTL = base_penalty × 2^infractions + random_jitter
+```
+
+| Infraction | Base=60s | TTL (± jitter) |
+|------------|----------|----------------|
+| 0 | 60s × 2⁰ | 60s ± 15s |
+| 1 | 60s × 2¹ | 2m ± 30s |
+| 3 | 60s × 2³ | 8m ± 2m |
+| 5 | 60s × 2⁵ | 32m ± 8m |
+| 10+ | capped | 24h ± 6h |
+
+Jitter prevents synchronized retry storms when a botnet emerges from jail simultaneously.
+
+## CIDR Aggregation
+
+When `cidr_threshold_v4` (default 5) IPs from the same /24 subnet are jailed, the entire /24 prefix is promoted. Any subsequent connection from that prefix is instantly blocked without per-IP lookup. Same logic for IPv6 /64 prefixes.
+
+## Log Fields
+
+The L7 handler sets Caddy variables consumable by `log_append`:
+
+```caddyfile
+log_append ddos_action      {http.vars.ddos_mitigator.action}
+log_append ddos_fingerprint  {http.vars.ddos_mitigator.fingerprint}
+log_append ddos_z_score      {http.vars.ddos_mitigator.z_score}
+log_append ddos_spike_mode   {http.vars.ddos_mitigator.spike_mode}
+```
+
+| Field | Values | Description |
+|-------|--------|-------------|
+| `ddos_action` | `pass`, `blocked`, `jailed` | What the mitigator decided |
+| `ddos_fingerprint` | hex string | FNV-64a hash of request signature |
+| `ddos_z_score` | float | Behavioral anomaly score |
+| `ddos_spike_mode` | `true`/`false` | Whether EWMA spike detection is active |
+
+## Jail File Format
+
+Shared bidirectionally with [wafctl](https://github.com/erfianugrah/caddy-compose) sidecar:
+
+```json
+{
+    "version": 1,
+    "entries": {
+        "198.51.100.1": {
+            "expires_at": "2026-03-16T12:00:00Z",
+            "infractions": 3,
+            "reason": "auto:behavioral",
+            "jailed_at": "2026-03-16T11:00:00Z"
+        }
+    },
+    "updated_at": "2026-03-16T11:00:05Z"
+}
+```
+
+## Container Capabilities
+
+| Feature | Required Cap | Docker Compose |
+|---------|-------------|----------------|
+| L7 + L4 (default) | `NET_BIND_SERVICE` | Already present |
+| nftables kernel drop | `NET_ADMIN` | `cap_add: [NET_ADMIN]` |
+| eBPF/XDP | `BPF`, `NET_ADMIN` | `cap_add: [BPF, NET_ADMIN]` |
+
+## Performance
+
+Benchmarks on AMD Ryzen 7 7800X3D (single-threaded, zero allocation):
+
+| Operation | Time | Allocs |
+|-----------|------|--------|
+| Jail IsJailed | 9 ns/op | 0 B/op |
+| CMS Increment | 8 ns/op | 0 B/op |
+| Fingerprint (full) | 70 ns/op | 0 B/op |
+| ExtractRemoteIP | 2.5 ns/op | 0 B/op |
+
+Total hot path (whitelist + jail + profile + CMS): ~90 ns per request with zero GC pressure.
+
+## Testing
+
+```bash
+# Unit tests (116 tests)
+go test -count=1 -timeout 60s ./...
+
+# Benchmarks
+go test -bench=. -benchmem ./...
+
+# Regenerate eBPF bytecode (requires clang + kernel headers)
+go generate ./...
+```
+
+## File Structure
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `mitigator.go` | 726 | L7 handler, Caddy lifecycle, Caddyfile parsing |
+| `nftables.go` | 286 | Kernel ipset management via google/nftables |
+| `profile.go` | 266 | Per-IP behavioral profiling + anomaly scoring |
+| `xdp.go` | 244 | eBPF/XDP loader via cilium/ebpf |
+| `jail.go` | 209 | 64-shard concurrent map, TTL, sweep, registry |
+| `util.go` | 172 | Whitelist, atomicWriteFile, jail file I/O |
+| `stats.go` | 173 | Welford + dual EWMA, z-score, spike detection |
+| `mitigator_l4.go` | 163 | L4 TCP RST handler, forceDrop |
+| `cidr.go` | 133 | CIDR prefix aggregation |
+| `cms.go` | 118 | Count-Min Sketch, atomic, decay |
+| `fingerprint.go` | 98 | 5 strategies, path normalization |
+| `bpf/xdp_drop.c` | 106 | XDP eBPF C program |
+| **Total production** | ~2900 | |
+| **Total tests** | ~2300 | 116 tests, 4 benchmarks |
+
+## License
+
+[MIT](LICENSE)

@@ -85,12 +85,31 @@ type DDOSMitigator struct {
 	// XDPSyncInterval is how often the BPF jail map is synced.
 	XDPSyncInterval caddy.Duration `json:"xdp_sync_interval,omitempty"`
 
+	// CIDRThresholdV4 is the number of jailed IPs from the same /24 needed
+	// to promote the entire prefix. Default: 5.
+	CIDRThresholdV4 int `json:"cidr_threshold_v4,omitempty"`
+
+	// CIDRThresholdV6 is the same for IPv6 /64 prefixes. Default: 5.
+	CIDRThresholdV6 int `json:"cidr_threshold_v6,omitempty"`
+
+	// ProfileTTL is how long IP behavioral profiles are retained. Default: 10m.
+	ProfileTTL caddy.Duration `json:"profile_ttl,omitempty"`
+
+	// ProfileMaxIPs is the maximum number of IP profiles tracked. Default: 100000.
+	ProfileMaxIPs int `json:"profile_max_ips,omitempty"`
+
+	// WarmupRequests is the minimum number of observations before the stats
+	// engine produces actionable z-scores. Prevents false positives during
+	// startup and low-traffic periods. Default: 1000.
+	WarmupRequests int `json:"warmup_requests,omitempty"`
+
 	// --- Internal state ---
 
 	jail      *ipJail
 	cms       *countMinSketch
 	stats     *adaptiveStats
 	tracker   *ipTracker
+	cidr      *cidrAggregator
 	whitelist *whitelist
 	nft       nftManager
 	xdp       xdpManager
@@ -147,8 +166,24 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 		m.jail = newIPJail()
 	}
 	m.cms = newCountMinSketch(m.CMSDepth, m.CMSWidth)
-	m.stats = newAdaptiveStats()
-	m.tracker = newIPTracker(100000, 10*time.Minute)
+	m.stats = newAdaptiveStatsWithWarmup(m.WarmupRequests)
+	if m.ProfileTTL == 0 {
+		m.ProfileTTL = caddy.Duration(10 * time.Minute)
+	}
+	if m.ProfileMaxIPs == 0 {
+		m.ProfileMaxIPs = 100000
+	}
+	if m.WarmupRequests == 0 {
+		m.WarmupRequests = 1000
+	}
+	if m.CIDRThresholdV4 == 0 {
+		m.CIDRThresholdV4 = 5
+	}
+	if m.CIDRThresholdV6 == 0 {
+		m.CIDRThresholdV6 = 5
+	}
+	m.tracker = newIPTracker(m.ProfileMaxIPs, time.Duration(m.ProfileTTL))
+	m.cidr = newCIDRAggregatorWithThresholds(m.CIDRThresholdV4, m.CIDRThresholdV6)
 	m.whitelist = newWhitelist(m.WhitelistCIDRs)
 	m.strategy.Store(int32(fpFull))
 
@@ -303,7 +338,7 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	}
 
 	// 2. Jail check — RLock on one of 64 shards
-	if m.jail.IsJailed(addr) {
+	if m.jail.IsJailed(addr) || m.cidr.IsPromoted(addr) {
 		m.setVars(r, "blocked", addr, 0)
 		w.WriteHeader(http.StatusForbidden)
 		return nil
@@ -329,6 +364,14 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			zap.Float64("threshold", m.Threshold),
 			zap.Duration("ttl", ttl),
 			zap.String("fingerprint", fpHex(fp)))
+
+		// Check CIDR aggregation — promote /24 or /64 if enough IPs from same subnet
+		if prefix := m.cidr.Check(m.jail, addr, ttl); prefix != nil {
+			m.logger.Warn("CIDR prefix promoted",
+				zap.String("prefix", prefix.String()),
+				zap.Duration("ttl", ttl))
+		}
+
 		w.WriteHeader(http.StatusForbidden)
 		return nil
 	}
@@ -611,6 +654,51 @@ func (m *DDOSMitigator) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Errf("invalid xdp_sync_interval: %v", err)
 			}
 			m.XDPSyncInterval = caddy.Duration(dur)
+		case "cidr_threshold_v4":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			var v int
+			if _, err := fmt.Sscanf(d.Val(), "%d", &v); err != nil {
+				return d.Errf("invalid cidr_threshold_v4: %v", err)
+			}
+			m.CIDRThresholdV4 = v
+		case "cidr_threshold_v6":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			var v int
+			if _, err := fmt.Sscanf(d.Val(), "%d", &v); err != nil {
+				return d.Errf("invalid cidr_threshold_v6: %v", err)
+			}
+			m.CIDRThresholdV6 = v
+		case "profile_ttl":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("invalid profile_ttl: %v", err)
+			}
+			m.ProfileTTL = caddy.Duration(dur)
+		case "profile_max_ips":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			var v int
+			if _, err := fmt.Sscanf(d.Val(), "%d", &v); err != nil {
+				return d.Errf("invalid profile_max_ips: %v", err)
+			}
+			m.ProfileMaxIPs = v
+		case "warmup_requests":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			var v int
+			if _, err := fmt.Sscanf(d.Val(), "%d", &v); err != nil {
+				return d.Errf("invalid warmup_requests: %v", err)
+			}
+			m.WarmupRequests = v
 		default:
 			return d.Errf("unknown ddos_mitigator directive: %s", d.Val())
 		}
