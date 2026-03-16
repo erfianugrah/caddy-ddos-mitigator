@@ -74,6 +74,17 @@ type DDOSMitigator struct {
 	// NftSyncInterval is how often the nftables ipset is synced with the jail.
 	NftSyncInterval caddy.Duration `json:"nft_sync_interval,omitempty"`
 
+	// XDPDrop enables eBPF/XDP packet dropping at the NIC driver level.
+	// Requires BPF + NET_ADMIN capabilities. Disabled by default.
+	XDPDrop bool `json:"xdp_drop,omitempty"`
+
+	// XDPIface is the network interface to attach the XDP program to.
+	// Required when xdp_drop is enabled. Example: "eth0".
+	XDPIface string `json:"xdp_iface,omitempty"`
+
+	// XDPSyncInterval is how often the BPF jail map is synced.
+	XDPSyncInterval caddy.Duration `json:"xdp_sync_interval,omitempty"`
+
 	// --- Internal state ---
 
 	jail      *ipJail
@@ -81,6 +92,7 @@ type DDOSMitigator struct {
 	stats     *adaptiveStats
 	whitelist *whitelist
 	nft       nftManager
+	xdp       xdpManager
 	strategy  atomic.Int32 // current fingerprintStrategy
 	logger    *zap.Logger
 	cancel    context.CancelFunc
@@ -161,6 +173,33 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 		m.nft = nftNoop{}
 	}
 
+	// Initialize XDP if enabled.
+	if m.XDPSyncInterval == 0 {
+		m.XDPSyncInterval = caddy.Duration(2 * time.Second)
+	}
+	if m.XDPDrop {
+		if m.XDPIface == "" {
+			m.logger.Warn("xdp_drop enabled but xdp_iface not set, disabling XDP")
+			m.xdp = xdpNoop{}
+		} else {
+			mgr := newXDPManager(m.XDPIface, m.logger)
+			if mgr.Available() {
+				if err := mgr.Setup(); err != nil {
+					m.logger.Error("XDP setup failed, falling back",
+						zap.Error(err))
+					m.xdp = xdpNoop{}
+				} else {
+					m.xdp = mgr
+				}
+			} else {
+				m.logger.Warn("xdp_drop enabled but BPF not available, falling back")
+				m.xdp = xdpNoop{}
+			}
+		}
+	} else {
+		m.xdp = xdpNoop{}
+	}
+
 	// Load jail file if configured
 	if m.JailFile != "" {
 		if err := readJailFile(m.JailFile, m.jail); err != nil {
@@ -185,6 +224,9 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 	if m.KernelDrop {
 		go m.runNftSync(bgCtx)
 	}
+	if m.XDPDrop {
+		go m.runXDPSync(bgCtx)
+	}
 
 	m.logger.Info("ddos_mitigator provisioned",
 		zap.Float64("threshold", m.Threshold),
@@ -192,7 +234,8 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 		zap.Int("cms_width", m.CMSWidth),
 		zap.Int("cms_depth", m.CMSDepth),
 		zap.Int("whitelist_prefixes", len(m.whitelist.prefixes)),
-		zap.Bool("kernel_drop", m.KernelDrop))
+		zap.Bool("kernel_drop", m.KernelDrop),
+		zap.Bool("xdp_drop", m.XDPDrop))
 
 	return nil
 }
@@ -222,7 +265,12 @@ func (m *DDOSMitigator) Cleanup() error {
 	if m.cancel != nil {
 		m.cancel()
 	}
-	// Clean up nftables rules/sets (no stale kernel state)
+	// Clean up kernel state (no stale rules/programs)
+	if m.xdp != nil {
+		if err := m.xdp.Cleanup(); err != nil {
+			m.logger.Error("XDP cleanup error", zap.Error(err))
+		}
+	}
 	if m.nft != nil {
 		if err := m.nft.Cleanup(); err != nil {
 			m.logger.Error("nftables cleanup error", zap.Error(err))
@@ -417,6 +465,22 @@ func (m *DDOSMitigator) runNftSync(ctx context.Context) {
 	}
 }
 
+func (m *DDOSMitigator) runXDPSync(ctx context.Context) {
+	ticker := time.NewTicker(time.Duration(m.XDPSyncInterval))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			snap := m.jail.Snapshot()
+			if err := m.xdp.SyncJail(snap); err != nil {
+				m.logger.Warn("XDP sync error", zap.Error(err))
+			}
+		}
+	}
+}
+
 // ─── Caddyfile Parsing ──────────────────────────────────────────────
 
 func (m *DDOSMitigator) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
@@ -521,6 +585,26 @@ func (m *DDOSMitigator) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Errf("invalid nft_sync_interval: %v", err)
 			}
 			m.NftSyncInterval = caddy.Duration(dur)
+		case "xdp_drop":
+			if d.NextArg() {
+				m.XDPDrop = d.Val() == "true" || d.Val() == "on"
+			} else {
+				m.XDPDrop = true
+			}
+		case "xdp_iface":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			m.XDPIface = d.Val()
+		case "xdp_sync_interval":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("invalid xdp_sync_interval: %v", err)
+			}
+			m.XDPSyncInterval = caddy.Duration(dur)
 		default:
 			return d.Errf("unknown ddos_mitigator directive: %s", d.Val())
 		}
