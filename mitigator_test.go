@@ -3,6 +3,7 @@ package ddosmitigator
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -231,19 +232,21 @@ func TestServeHTTP_AutoJailsOnThresholdBreach(t *testing.T) {
 		m.CMSWidth = 256  // Small sketch for faster collision-free test
 	})
 
-	// Build a baseline of normal traffic from many IPs
-	for i := range 200 {
+	// Build a baseline of diverse traffic — must exceed minObservationsForZScore
+	// so the stats engine produces actionable z-scores.
+	for i := range 1200 {
 		next := &nextHandler{}
 		w := httptest.NewRecorder()
-		addr := netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)})
-		r := makeRequest("GET", "/normal", addr.String()+":1234")
+		addr := netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)})
+		path := fmt.Sprintf("/normal/%d", i%50)
+		r := makeRequest("GET", path, addr.String()+":1234")
 		m.ServeHTTP(w, r, next)
 	}
 
 	// Now hammer from a single IP+path repeatedly — should trigger z-score breach
 	attacker := "198.51.100.99:12345"
 	var jailed bool
-	for range 500 {
+	for range 2000 {
 		next := &nextHandler{}
 		w := httptest.NewRecorder()
 		r := makeRequest("GET", "/attack", attacker)

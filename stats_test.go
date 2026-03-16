@@ -75,7 +75,7 @@ func TestStats_NumericalStability(t *testing.T) {
 
 func TestStats_ZeroVariance(t *testing.T) {
 	s := newAdaptiveStats()
-	for range 100 {
+	for range 2000 {
 		s.Observe(5.0)
 	}
 
@@ -122,7 +122,7 @@ func TestStats_ZScore(t *testing.T) {
 
 func TestStats_ZScoreWithZeroStdDev(t *testing.T) {
 	s := newAdaptiveStats()
-	for range 100 {
+	for range 2000 {
 		s.Observe(5.0)
 	}
 

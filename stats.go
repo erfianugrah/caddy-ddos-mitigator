@@ -29,6 +29,13 @@ const (
 	// Minimum stddev to avoid division by zero in z-score.
 	// When stddev is below this, deviations from mean get a high z-score.
 	minStdDev = 1e-9
+
+	// Minimum number of observations before z-score becomes actionable.
+	// Until the stats engine has seen enough diverse traffic to build a
+	// meaningful baseline, ZScore() returns 0 (no auto-jail). This prevents
+	// false positives during startup and low-traffic periods where a single
+	// user browsing normally would appear anomalous against a near-zero mean.
+	minObservationsForZScore = 1000
 )
 
 // ─── Types ──────────────────────────────────────────────────────────
@@ -115,7 +122,10 @@ func (s *adaptiveStats) ZScore(x float64) float64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.count < 2 {
+	// Don't produce actionable z-scores until we have a real baseline.
+	// With too few observations, the mean and variance are meaningless —
+	// a single user browsing normally looks anomalous against near-zero stats.
+	if s.count < minObservationsForZScore {
 		return 0
 	}
 
