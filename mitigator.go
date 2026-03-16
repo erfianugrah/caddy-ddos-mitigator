@@ -334,6 +334,7 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 	// 1. Whitelist check
 	if m.whitelist.Contains(addr) {
+		m.setVars(r, "pass", addr, 0)
 		return next.ServeHTTP(w, r)
 	}
 
