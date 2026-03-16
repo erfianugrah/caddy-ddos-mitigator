@@ -206,14 +206,11 @@ func TestServeHTTP_BlocksJailedIP(t *testing.T) {
 	r := makeRequest("GET", "/", "198.51.100.1:12345")
 
 	err := m.ServeHTTP(w, r, next)
-	if err != nil {
-		t.Fatalf("ServeHTTP: %v", err)
+	if err == nil {
+		t.Fatal("expected caddyhttp.Error for jailed IP, got nil")
 	}
 	if next.called {
 		t.Fatal("next handler should NOT be called for jailed IP")
-	}
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("status: got %d, want 403", w.Code)
 	}
 }
 
@@ -251,8 +248,8 @@ func TestServeHTTP_AutoJailsOnThresholdBreach(t *testing.T) {
 		next := &nextHandler{}
 		w := httptest.NewRecorder()
 		r := makeRequest("GET", "/attack", attacker)
-		m.ServeHTTP(w, r, next)
-		if w.Code == http.StatusForbidden && !next.called {
+		err := m.ServeHTTP(w, r, next)
+		if err != nil && !next.called {
 			jailed = true
 			break
 		}

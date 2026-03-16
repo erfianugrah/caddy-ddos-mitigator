@@ -375,8 +375,7 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	// 2. Jail check — RLock on one of 64 shards
 	if m.jail.IsJailed(addr) || m.cidr.IsPromoted(addr) {
 		m.setVars(r, "blocked", addr, 0, "")
-		w.WriteHeader(http.StatusForbidden)
-		return nil
+		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
 	// 3. Record behavioral profile + update CMS for EPS tracking
@@ -408,8 +407,7 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				zap.Duration("ttl", ttl))
 		}
 
-		w.WriteHeader(http.StatusForbidden)
-		return nil
+		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
 	// 5. Pass through
