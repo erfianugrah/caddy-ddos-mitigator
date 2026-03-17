@@ -160,41 +160,44 @@ func writeJailFile(path string, j *ipJail) error {
 }
 
 // readJailFile reads a jail file and merges its entries into the jail.
-// Entries already in the jail are not overwritten (plugin entries take precedence).
-// Missing file is a no-op. Expired entries in the file are skipped.
+// Wrapper around readJailFileIPs that discards the IP set and skipped count.
 func readJailFile(path string, j *ipJail) error {
-	_, err := readJailFileIPs(path, j)
+	_, _, err := readJailFileIPs(path, j)
 	return err
 }
 
 // readJailFileIPs reads a jail file, merges new entries into the jail, and
-// returns the set of non-expired IPs present in the file. This allows callers
-// to detect IPs that were removed from the file (e.g., unjailed via wafctl).
+// returns the set of non-expired IPs present in the file plus a count of
+// entries that were skipped due to parse errors. This allows callers to
+// detect IPs that were removed from the file (e.g., unjailed via wafctl).
 // Returns nil map if the file does not exist.
-func readJailFileIPs(path string, j *ipJail) (map[netip.Addr]bool, error) {
+func readJailFileIPs(path string, j *ipJail) (map[netip.Addr]bool, int, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
+			return nil, 0, nil
 		}
-		return nil, fmt.Errorf("read jail file: %w", err)
+		return nil, 0, fmt.Errorf("read jail file: %w", err)
 	}
 
 	var f jailFileFormat
 	if err := json.Unmarshal(data, &f); err != nil {
-		return nil, fmt.Errorf("unmarshal jail file: %w", err)
+		return nil, 0, fmt.Errorf("unmarshal jail file: %w", err)
 	}
 
 	now := time.Now()
+	var skipped int
 	fileIPs := make(map[netip.Addr]bool, len(f.Entries))
 	for ipStr, entry := range f.Entries {
 		addr, err := netip.ParseAddr(ipStr)
 		if err != nil {
-			continue // skip invalid IPs
+			skipped++
+			continue
 		}
 
 		expiresAt, err := time.Parse(time.RFC3339, entry.ExpiresAt)
 		if err != nil {
+			skipped++
 			continue
 		}
 
@@ -214,5 +217,5 @@ func readJailFileIPs(path string, j *ipJail) (map[netip.Addr]bool, error) {
 		j.Add(addr, ttl, entry.Reason, entry.Infractions)
 	}
 
-	return fileIPs, nil
+	return fileIPs, skipped, nil
 }

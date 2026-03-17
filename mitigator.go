@@ -363,7 +363,8 @@ func (m *DDOSMitigator) Cleanup() error {
 func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	addr, ok := clientAddr(r)
 	if !ok {
-		// Can't determine client IP — pass through
+		m.logger.Debug("could not extract client IP, passing through",
+			zap.String("remote_addr", r.RemoteAddr))
 		return next.ServeHTTP(w, r)
 	}
 
@@ -534,9 +535,14 @@ func (m *DDOSMitigator) runFileSync(ctx context.Context) {
 
 				// Read file to learn which IPs wafctl currently has.
 				// readJailFile merges new entries; it does NOT remove stale ones.
-				fileIPs, err := readJailFileIPs(m.JailFile, m.jail)
+				fileIPs, skipped, err := readJailFileIPs(m.JailFile, m.jail)
 				if err != nil {
 					m.logger.Warn("jail file read error", zap.Error(err))
+				}
+				if skipped > 0 {
+					m.logger.Warn("jail file contained invalid entries",
+						zap.Int("skipped", skipped),
+						zap.String("path", m.JailFile))
 				}
 
 				// Detect IPs that wafctl explicitly unjailed:

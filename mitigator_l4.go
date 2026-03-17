@@ -83,6 +83,8 @@ func (m *DDOSMitigatorL4) Provision(ctx caddy.Context) error {
 func (m *DDOSMitigatorL4) Handle(cx *layer4.Connection, next layer4.Handler) error {
 	addr, ok := extractRemoteIP(cx.Conn.RemoteAddr())
 	if !ok {
+		m.logger.Debug("L4: could not extract remote IP, passing through",
+			zap.String("remote_addr", cx.Conn.RemoteAddr().String()))
 		return next.Handle(cx)
 	}
 

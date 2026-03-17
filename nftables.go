@@ -302,7 +302,6 @@ func (n *nftReal) Cleanup() error {
 	// Delete the entire table — removes all chains, sets, rules.
 	n.conn.DelTable(n.table)
 	if err := n.conn.Flush(); err != nil {
-		n.logger.Warn("nftables cleanup error", zap.Error(err))
 		return err
 	}
 
