@@ -44,7 +44,7 @@ example.com {
         threshold         0.65          # behavioral anomaly score (0.0–1.0)
         base_penalty      60s           # first offense jail duration
         max_penalty       24h           # cap for exponential backoff
-        warmup_requests   1000          # min observations before z-score activates
+        warmup_requests   1000          # min observations before adaptive stats activate
 
         # Behavioral profiling
         profile_ttl       10m           # how long IP profiles are retained
@@ -210,7 +210,7 @@ log_append ddos_spike_mode   {http.vars.ddos_mitigator.spike_mode}
 |-------|--------|-------------|
 | `ddos_action` | `pass`, `blocked`, `jailed` | What the mitigator decided |
 | `ddos_fingerprint` | hex string | FNV-64a hash of request signature |
-| `ddos_z_score` | float | Behavioral anomaly score |
+| `ddos_z_score` | float | Behavioral anomaly score (0.0-1.0, not a statistical z-score; name kept for backward compatibility) |
 | `ddos_spike_mode` | `true`/`false` | Whether EWMA spike detection is active |
 
 ## Jail File Format
@@ -270,20 +270,18 @@ go generate ./...
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `mitigator.go` | 745 | L7 handler, Caddy lifecycle, Caddyfile parsing |
-| `nftables.go` | 286 | Kernel ipset management via google/nftables |
-| `profile.go` | 275 | Per-IP behavioral profiling + anomaly scoring |
-| `xdp.go` | 244 | eBPF/XDP loader via cilium/ebpf |
-| `jail.go` | 209 | 64-shard concurrent map, TTL, sweep, registry |
-| `stats.go` | 173 | Welford + dual EWMA, z-score, spike detection |
-| `util.go` | 172 | Whitelist, atomicWriteFile, jail file I/O |
+| `mitigator.go` | 810 | L7 handler, Caddy lifecycle, Caddyfile parsing |
+| `nftables.go` | 321 | Kernel ipset management via google/nftables |
+| `profile.go` | 313 | Per-IP behavioral profiling + anomaly scoring |
+| `xdp.go` | 253 | eBPF/XDP loader via cilium/ebpf |
+| `jail.go` | 248 | 64-shard concurrent map, TTL, sweep, registry |
+| `util.go` | 222 | Whitelist, atomicWriteFile, jail file I/O |
+| `stats.go` | 173 | Welford + dual EWMA, spike detection |
 | `mitigator_l4.go` | 163 | L4 TCP RST handler, forceDrop |
-| `cidr.go` | 133 | CIDR prefix aggregation |
-| `cms.go` | 118 | Count-Min Sketch, atomic, decay |
-| `fingerprint.go` | 98 | 5 strategies, path normalization |
+| `cidr.go` | 178 | CIDR prefix aggregation |
+| `cms.go` | 127 | Count-Min Sketch, atomic, decay |
+| `fingerprint.go` | 113 | 5 strategies, path normalization |
 | `bpf/xdp_drop.c` | 106 | XDP eBPF C program |
-| **Total production** | ~3100 | |
-| **Total tests** | ~2150 | 116 tests, 4 benchmarks |
 
 ## Security
 

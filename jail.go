@@ -24,7 +24,7 @@ const jailShards = 64
 type jailEntry struct {
 	ExpiresAt       int64  // unix nanoseconds
 	InfractionCount int32  // drives exponential backoff
-	Reason          string // "auto:z-score", "auto:threshold", "manual", "file:wafctl"
+	Reason          string // "auto:behavioral", "manual", "file:wafctl"
 	JailedAt        int64  // unix nanoseconds
 }
 

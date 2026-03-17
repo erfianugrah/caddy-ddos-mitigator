@@ -41,13 +41,6 @@ func newCIDRAggregatorWithThresholds(v4, v6 int) *cidrAggregator {
 	}
 }
 
-func newCIDRAggregator() *cidrAggregator {
-	return &cidrAggregator{
-		promoted: make(map[netip.Prefix]time.Time),
-		counters: make(map[netip.Prefix]*atomic.Int32),
-	}
-}
-
 // prefixFor returns the aggregation prefix for an address.
 func prefixFor(addr netip.Addr) (netip.Prefix, bool) {
 	var prefixLen int

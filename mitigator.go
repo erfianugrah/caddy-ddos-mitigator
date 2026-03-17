@@ -3,8 +3,9 @@
 // request fingerprints against adaptive statistical thresholds, auto-jails
 // offending IPs, and blocks subsequent requests.
 //
-// Handler ordering: ddos_mitigator runs before log_append and policy_engine.
-// Blocked traffic never reaches the WAF, saving all downstream CPU.
+// Handler ordering: log_append runs first (outermost), then ddos_mitigator,
+// then policy_engine. Blocked traffic never reaches the WAF, saving all
+// downstream CPU.
 //
 // Module ID: http.handlers.ddos_mitigator
 package ddosmitigator
@@ -40,7 +41,7 @@ type DDOSMitigator struct {
 	// JailFile is the path to the shared jail JSON file (bidirectional with wafctl).
 	JailFile string `json:"jail_file,omitempty"`
 
-	// Threshold is the z-score above which a fingerprint triggers auto-jail.
+	// Threshold is the behavioral anomaly score (0.0-1.0) above which an IP triggers auto-jail.
 	Threshold float64 `json:"threshold,omitempty"`
 
 	// BasePenalty is the initial jail duration for the first offense.
@@ -447,10 +448,12 @@ func (m *DDOSMitigator) infractionCount(addr netip.Addr) int32 {
 
 // ─── Log Variables ──────────────────────────────────────────────────
 
-func (m *DDOSMitigator) setVars(r *http.Request, action string, addr netip.Addr, zScore float64, fingerprint string) {
+func (m *DDOSMitigator) setVars(r *http.Request, action string, addr netip.Addr, score float64, fingerprint string) {
 	caddyhttp.SetVar(r.Context(), "ddos_mitigator.action", action)
 	caddyhttp.SetVar(r.Context(), "ddos_mitigator.ip", addr.String())
-	caddyhttp.SetVar(r.Context(), "ddos_mitigator.z_score", fmt.Sprintf("%.2f", zScore))
+	// NOTE: the variable key is kept as "z_score" for backward compatibility
+	// with existing log templates, but the value is the behavioral anomaly score (0.0-1.0).
+	caddyhttp.SetVar(r.Context(), "ddos_mitigator.z_score", fmt.Sprintf("%.2f", score))
 	caddyhttp.SetVar(r.Context(), "ddos_mitigator.spike_mode", fmt.Sprintf("%t", m.stats.IsSpikeMode()))
 	if fingerprint != "" {
 		caddyhttp.SetVar(r.Context(), "ddos_mitigator.fingerprint", fingerprint)
@@ -529,18 +532,30 @@ func (m *DDOSMitigator) runFileSync(ctx context.Context) {
 				// Snapshot current jail before reading file
 				beforeSync := m.jail.Snapshot()
 
-				// Read new entries from file (written by wafctl)
-				if err := readJailFile(m.JailFile, m.jail); err != nil {
+				// Read file to learn which IPs wafctl currently has.
+				// readJailFile merges new entries; it does NOT remove stale ones.
+				fileIPs, err := readJailFileIPs(m.JailFile, m.jail)
+				if err != nil {
 					m.logger.Warn("jail file read error", zap.Error(err))
 				}
 
-				// Check for IPs that were manually unjailed via wafctl API:
-				// if an IP was in the jail before sync but is no longer jailed,
-				// clear its behavioral profile so it won't be immediately re-jailed.
+				// Detect IPs that wafctl explicitly unjailed:
+				// an IP was jailed before sync, is still jailed now (not expired),
+				// but is absent from the file → wafctl removed it.
 				for addr := range beforeSync {
 					if !m.jail.IsJailed(addr) {
+						// Expired naturally between cycles — reset profile.
 						m.tracker.Reset(addr)
-						m.logger.Info("cleared behavioral profile for unjailed IP",
+						m.logger.Info("cleared behavioral profile for expired IP",
+							zap.String("ip", addr.String()))
+						continue
+					}
+					if fileIPs != nil && !fileIPs[addr] {
+						// Still jailed in memory but removed from file by wafctl.
+						m.jail.Remove(addr)
+						m.cidr.DecrementPrefix(addr)
+						m.tracker.Reset(addr)
+						m.logger.Info("unjailed IP removed by wafctl",
 							zap.String("ip", addr.String()))
 					}
 				}
