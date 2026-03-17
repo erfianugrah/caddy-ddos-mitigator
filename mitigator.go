@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -112,17 +113,18 @@ type DDOSMitigator struct {
 
 	// --- Internal state ---
 
-	jail      *ipJail
-	cms       *countMinSketch
-	stats     *adaptiveStats
-	tracker   *ipTracker
-	cidr      *cidrAggregator
-	whitelist *whitelist
-	nft       nftManager
-	xdp       xdpManager
-	strategy  atomic.Int32 // current fingerprintStrategy
-	logger    *zap.Logger
-	cancel    context.CancelFunc
+	jail       *ipJail
+	cms        *countMinSketch
+	stats      *adaptiveStats
+	tracker    *ipTracker
+	cidr       *cidrAggregator
+	whitelist  *whitelist
+	graceUntil sync.Map // netip.Addr → int64 (unix nano) — unjail grace period
+	nft        nftManager
+	xdp        xdpManager
+	strategy   atomic.Int32 // current fingerprintStrategy
+	logger     *zap.Logger
+	cancel     context.CancelFunc
 }
 
 // ─── Caddy Module Interface ─────────────────────────────────────────
@@ -403,6 +405,14 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 	// 4. Behavioral anomaly check — score based on path diversity, not raw volume.
 	// Normal users browsing diverse pages score ~0. Floods hitting one endpoint score ~0.8+.
+	// Skip auto-jail during unjail grace period (prevents immediate re-jail after manual unjail).
+	if graceExp, ok := m.graceUntil.Load(addr); ok {
+		if time.Now().UnixNano() < graceExp.(int64) {
+			score = 0 // suppress scoring during grace period
+		} else {
+			m.graceUntil.Delete(addr) // grace expired, clean up
+		}
+	}
 	if score > m.Threshold {
 		ttl := m.calcTTL(addr)
 		m.jail.Add(addr, ttl, "auto:behavioral", m.infractionCount(addr))
@@ -586,7 +596,10 @@ func (m *DDOSMitigator) runFileSync(ctx context.Context) {
 						m.jail.Remove(addr)
 						m.cidr.DecrementPrefix(addr)
 						m.tracker.Reset(addr)
-						m.logger.Info("unjailed IP removed by wafctl",
+						// Grace period: prevent immediate re-jail from stale profile data.
+						// 60 seconds gives enough time for the IP to build a new, diverse profile.
+						m.graceUntil.Store(addr, time.Now().Add(60*time.Second).UnixNano())
+						m.logger.Info("unjailed IP removed by wafctl (60s grace period)",
 							zap.String("ip", addr.String()))
 					}
 				}
