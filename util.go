@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -93,32 +94,74 @@ func withFileLock(path string, fn func() error) error {
 // ─── Whitelist ──────────────────────────────────────────────────────
 
 // whitelist holds a static set of CIDR prefixes that bypass jail checks.
+// whitelist holds an atomically-swappable set of CIDR prefixes.
+// The inner whitelistData is immutable — updates create a new instance
+// and swap the pointer atomically, so Contains() is lock-free.
 type whitelist struct {
+	data atomic.Pointer[whitelistData]
+}
+
+type whitelistData struct {
 	prefixes []netip.Prefix
 }
 
 // newWhitelist parses CIDR strings and returns a whitelist.
 // Returns an error if any CIDR is invalid.
 func newWhitelist(cidrs []string) (*whitelist, error) {
-	w := &whitelist{}
+	d := &whitelistData{}
 	for _, s := range cidrs {
 		p, err := netip.ParsePrefix(s)
 		if err != nil {
 			return nil, fmt.Errorf("invalid whitelist CIDR %q: %w", s, err)
 		}
-		w.prefixes = append(w.prefixes, p)
+		d.prefixes = append(d.prefixes, p)
 	}
+	w := &whitelist{}
+	w.data.Store(d)
 	return w, nil
 }
 
+// Update atomically replaces the whitelist with new CIDRs.
+// Invalid CIDRs are silently skipped (logged by caller).
+func (w *whitelist) Update(cidrs []string) error {
+	d := &whitelistData{}
+	for _, s := range cidrs {
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			return fmt.Errorf("invalid whitelist CIDR %q: %w", s, err)
+		}
+		d.prefixes = append(d.prefixes, p)
+	}
+	w.data.Store(d)
+	return nil
+}
+
 // Contains returns true if the address falls within any whitelisted prefix.
+// Lock-free — reads the atomic pointer.
 func (w *whitelist) Contains(addr netip.Addr) bool {
-	for _, p := range w.prefixes {
+	d := w.data.Load()
+	if d == nil {
+		return false
+	}
+	for _, p := range d.prefixes {
 		if p.Contains(addr) {
 			return true
 		}
 	}
 	return false
+}
+
+// CIDRs returns the current whitelist CIDRs as strings.
+func (w *whitelist) CIDRs() []string {
+	d := w.data.Load()
+	if d == nil {
+		return nil
+	}
+	result := make([]string, len(d.prefixes))
+	for i, p := range d.prefixes {
+		result[i] = p.String()
+	}
+	return result
 }
 
 // ─── Atomic File Write ──────────────────────────────────────────────
@@ -164,6 +207,7 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 type jailFileFormat struct {
 	Version   int                      `json:"version"`
 	Entries   map[string]jailFileEntry `json:"entries"`
+	Whitelist []string                 `json:"whitelist,omitempty"` // CIDR prefixes, updated by wafctl
 	UpdatedAt string                   `json:"updated_at"`
 }
 
@@ -176,12 +220,14 @@ type jailFileEntry struct {
 }
 
 // writeJailFile serializes the jail's non-expired entries to a JSON file.
+// Includes the current whitelist CIDRs so wafctl can read/update them.
 // Uses atomic write to prevent partial reads by wafctl.
-func writeJailFile(path string, j *ipJail) error {
+func writeJailFile(path string, j *ipJail, wl *whitelist) error {
 	snap := j.Snapshot()
 	f := jailFileFormat{
 		Version:   1,
 		Entries:   make(map[string]jailFileEntry, len(snap)),
+		Whitelist: wl.CIDRs(),
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 
@@ -202,9 +248,9 @@ func writeJailFile(path string, j *ipJail) error {
 }
 
 // readJailFile reads a jail file and merges its entries into the jail.
-// Wrapper around readJailFileIPs that discards the IP set and skipped count.
+// Wrapper around readJailFileIPs that discards the result.
 func readJailFile(path string, j *ipJail) error {
-	_, _, err := readJailFileIPs(path, j)
+	_, err := readJailFileIPs(path, j)
 	return err
 }
 
@@ -213,33 +259,42 @@ func readJailFile(path string, j *ipJail) error {
 // entries that were skipped due to parse errors. This allows callers to
 // detect IPs that were removed from the file (e.g., unjailed via wafctl).
 // Returns nil map if the file does not exist.
-func readJailFileIPs(path string, j *ipJail) (map[netip.Addr]bool, int, error) {
+// jailFileResult holds the parsed contents of a jail file.
+type jailFileResult struct {
+	IPs       map[netip.Addr]bool // non-expired IPs present in the file
+	Whitelist []string            // CIDR prefixes from the file (may be nil)
+	Skipped   int                 // entries that failed to parse
+}
+
+func readJailFileIPs(path string, j *ipJail) (*jailFileResult, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, 0, nil
+			return nil, nil
 		}
-		return nil, 0, fmt.Errorf("read jail file: %w", err)
+		return nil, fmt.Errorf("read jail file: %w", err)
 	}
 
 	var f jailFileFormat
 	if err := json.Unmarshal(data, &f); err != nil {
-		return nil, 0, fmt.Errorf("unmarshal jail file: %w", err)
+		return nil, fmt.Errorf("unmarshal jail file: %w", err)
 	}
 
 	now := time.Now()
-	var skipped int
-	fileIPs := make(map[netip.Addr]bool, len(f.Entries))
+	result := &jailFileResult{
+		IPs:       make(map[netip.Addr]bool, len(f.Entries)),
+		Whitelist: f.Whitelist,
+	}
 	for ipStr, entry := range f.Entries {
 		addr, err := netip.ParseAddr(ipStr)
 		if err != nil {
-			skipped++
+			result.Skipped++
 			continue
 		}
 
 		expiresAt, err := time.Parse(time.RFC3339, entry.ExpiresAt)
 		if err != nil {
-			skipped++
+			result.Skipped++
 			continue
 		}
 
@@ -248,7 +303,7 @@ func readJailFileIPs(path string, j *ipJail) (map[netip.Addr]bool, int, error) {
 			continue
 		}
 
-		fileIPs[addr] = true
+		result.IPs[addr] = true
 
 		// Don't overwrite existing entries (plugin state takes precedence)
 		if j.IsJailed(addr) {
@@ -259,5 +314,5 @@ func readJailFileIPs(path string, j *ipJail) (map[netip.Addr]bool, int, error) {
 		j.Add(addr, ttl, entry.Reason, entry.Infractions)
 	}
 
-	return fileIPs, skipped, nil
+	return result, nil
 }

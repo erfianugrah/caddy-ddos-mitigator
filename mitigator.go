@@ -156,7 +156,7 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 		m.DecayInterval = caddy.Duration(30 * time.Second)
 	}
 	if m.SyncInterval == 0 {
-		m.SyncInterval = caddy.Duration(5 * time.Second)
+		m.SyncInterval = caddy.Duration(2 * time.Second)
 	}
 	if m.CMSWidth == 0 {
 		m.CMSWidth = 8192
@@ -284,7 +284,7 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 		zap.Duration("base_penalty", time.Duration(m.BasePenalty)),
 		zap.Int("cms_width", m.CMSWidth),
 		zap.Int("cms_depth", m.CMSDepth),
-		zap.Int("whitelist_prefixes", len(m.whitelist.prefixes)),
+		zap.Int("whitelist_prefixes", len(m.whitelist.CIDRs())),
 		zap.Bool("kernel_drop", m.KernelDrop),
 		zap.Bool("xdp_drop", m.XDPDrop))
 
@@ -350,7 +350,7 @@ func (m *DDOSMitigator) Cleanup() error {
 	}
 	// Write final jail state
 	if m.JailFile != "" && m.jail != nil {
-		if err := writeJailFile(m.JailFile, m.jail); err != nil {
+		if err := writeJailFile(m.JailFile, m.jail, m.whitelist); err != nil {
 			m.logger.Error("failed to write jail file on cleanup",
 				zap.String("path", m.JailFile), zap.Error(err))
 		}
@@ -553,14 +553,21 @@ func (m *DDOSMitigator) runFileSync(ctx context.Context) {
 
 				// Read file to learn which IPs wafctl currently has.
 				// readJailFile merges new entries; it does NOT remove stale ones.
-				fileIPs, skipped, err := readJailFileIPs(m.JailFile, m.jail)
+				fileResult, err := readJailFileIPs(m.JailFile, m.jail)
 				if err != nil {
 					m.logger.Warn("jail file read error", zap.Error(err))
 				}
-				if skipped > 0 {
+				if fileResult != nil && fileResult.Skipped > 0 {
 					m.logger.Warn("jail file contained invalid entries",
-						zap.Int("skipped", skipped),
+						zap.Int("skipped", fileResult.Skipped),
 						zap.String("path", m.JailFile))
+				}
+
+				// Apply whitelist updates from the file (wafctl writes these).
+				if fileResult != nil && fileResult.Whitelist != nil {
+					if err := m.whitelist.Update(fileResult.Whitelist); err != nil {
+						m.logger.Warn("whitelist update from file failed", zap.Error(err))
+					}
 				}
 
 				// Detect IPs that wafctl explicitly unjailed:
@@ -574,7 +581,7 @@ func (m *DDOSMitigator) runFileSync(ctx context.Context) {
 							zap.String("ip", addr.String()))
 						continue
 					}
-					if fileIPs != nil && !fileIPs[addr] {
+					if fileResult != nil && fileResult.IPs != nil && !fileResult.IPs[addr] {
 						// Still jailed in memory but removed from file by wafctl.
 						m.jail.Remove(addr)
 						m.cidr.DecrementPrefix(addr)
@@ -587,7 +594,7 @@ func (m *DDOSMitigator) runFileSync(ctx context.Context) {
 				// Write current jail state to file (for wafctl to read),
 				// but only if the jail has been modified since the last write.
 				if m.jail.dirty.CompareAndSwap(true, false) {
-					if err := writeJailFile(m.JailFile, m.jail); err != nil {
+					if err := writeJailFile(m.JailFile, m.jail, m.whitelist); err != nil {
 						m.logger.Warn("jail file write error", zap.Error(err))
 						m.jail.dirty.Store(true) // restore flag on failure
 					}

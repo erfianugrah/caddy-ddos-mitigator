@@ -10,6 +10,11 @@ import (
 	"time"
 )
 
+func emptyWhitelist() *whitelist {
+	w, _ := newWhitelist(nil)
+	return w
+}
+
 // --- Whitelist Tests ---
 
 func TestWhitelist_Contains(t *testing.T) {
@@ -153,7 +158,7 @@ func TestJailFile_WriteAndRead(t *testing.T) {
 	j.Add(netip.MustParseAddr("192.0.2.1"), 1*time.Hour, "auto:z-score", 3)
 	j.Add(netip.MustParseAddr("2001:db8::1"), 30*time.Minute, "manual", 1)
 
-	if err := writeJailFile(path, j); err != nil {
+	if err := writeJailFile(path, j, emptyWhitelist()); err != nil {
 		t.Fatalf("writeJailFile: %v", err)
 	}
 
@@ -195,7 +200,7 @@ func TestJailFile_SkipsExpired(t *testing.T) {
 
 	time.Sleep(10 * time.Millisecond)
 
-	if err := writeJailFile(path, j); err != nil {
+	if err := writeJailFile(path, j, emptyWhitelist()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -220,7 +225,7 @@ func TestJailFile_MergePreservesExisting(t *testing.T) {
 	// Write a file with one entry (simulating wafctl writing)
 	j1 := newIPJail()
 	j1.Add(netip.MustParseAddr("192.0.2.1"), 1*time.Hour, "manual", 0)
-	if err := writeJailFile(path, j1); err != nil {
+	if err := writeJailFile(path, j1, emptyWhitelist()); err != nil {
 		t.Fatal(err)
 	}
 
