@@ -15,6 +15,48 @@ import (
 	"time"
 )
 
+// ─── Inline FNV-1a (Zero Allocation) ────────────────────────────────
+
+const (
+	fnv1aOffset32 = uint32(2166136261)
+	fnv1aPrime32  = uint32(16777619)
+	fnv1aOffset64 = uint64(14695981039346656037)
+	fnv1aPrime64  = uint64(1099511628211)
+)
+
+// fnv32a computes FNV-1a 32-bit hash of a byte slice with zero allocation.
+func fnv32a(data []byte) uint32 {
+	h := fnv1aOffset32
+	for _, b := range data {
+		h ^= uint32(b)
+		h *= fnv1aPrime32
+	}
+	return h
+}
+
+// fnv64a computes FNV-1a 64-bit hash of byte slices with zero allocation.
+// Accepts variadic slices to hash multiple inputs without concatenation.
+func fnv64a(parts ...[]byte) uint64 {
+	h := fnv1aOffset64
+	for _, data := range parts {
+		for _, b := range data {
+			h ^= uint64(b)
+			h *= fnv1aPrime64
+		}
+	}
+	return h
+}
+
+// fnv64aSeeded computes FNV-1a 64-bit hash with a seed XOR'd into the offset.
+func fnv64aSeeded(seed uint64, data []byte) uint64 {
+	h := fnv1aOffset64 ^ seed
+	for _, b := range data {
+		h ^= uint64(b)
+		h *= fnv1aPrime64
+	}
+	return h
+}
+
 // ─── Jail Path Validation ───────────────────────────────────────────
 
 // validateJailPath checks that the jail file path is absolute and not a symlink.

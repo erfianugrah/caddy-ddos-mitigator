@@ -25,7 +25,7 @@ const (
 // cidrAggregator tracks per-prefix jail counts and promotes prefixes.
 // Uses per-prefix atomic counters (O(1)) instead of O(N) snapshot scanning.
 type cidrAggregator struct {
-	mu          sync.Mutex
+	mu          sync.RWMutex
 	promoted    map[netip.Prefix]time.Time // promoted prefixes → expiry
 	counters    map[netip.Prefix]*atomic.Int32
 	thresholdV4 int
@@ -136,15 +136,16 @@ func (c *cidrAggregator) Check(addr netip.Addr, ttl time.Duration) *netip.Prefix
 }
 
 // IsPromoted returns true if the given IP falls within a promoted prefix.
+// Uses RLock — no mutation on the read path. Expired entries are cleaned
+// by the background Sweep() goroutine instead of lazy deletion here.
 func (c *cidrAggregator) IsPromoted(addr netip.Addr) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	now := time.Now()
 	for prefix, exp := range c.promoted {
 		if now.After(exp) {
-			delete(c.promoted, prefix)
-			continue
+			continue // skip expired, don't delete — Sweep() handles it
 		}
 		if prefix.Contains(addr) {
 			return true

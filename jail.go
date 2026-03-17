@@ -7,7 +7,6 @@
 package ddosmitigator
 
 import (
-	"hash/fnv"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -54,9 +53,7 @@ func newIPJail() *ipJail {
 
 func (j *ipJail) shard(addr netip.Addr) *jailShard {
 	b := addr.As16()
-	h := fnv.New32a()
-	h.Write(b[:])
-	return &j.shards[h.Sum32()%jailShards]
+	return &j.shards[fnv32a(b[:])%jailShards]
 }
 
 // ─── Public API ─────────────────────────────────────────────────────

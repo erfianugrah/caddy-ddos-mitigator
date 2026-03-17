@@ -10,7 +10,6 @@ package ddosmitigator
 
 import (
 	"encoding/hex"
-	"hash/fnv"
 	"net/netip"
 	"net/url"
 	"path"
@@ -32,41 +31,36 @@ const (
 // ─── Compute ────────────────────────────────────────────────────────
 
 // computeFingerprint hashes request attributes according to the given strategy.
-// Returns an 8-byte hash suitable as a CMS key.
+// Returns an 8-byte hash suitable as a CMS key. Zero allocation — uses inline FNV-1a.
 func computeFingerprint(strat fingerprintStrategy, addr netip.Addr, method, rawPath, ua string, pathDepth int) [8]byte {
-	h := fnv.New64a()
 	ip16 := addr.As16()
 	normPath := normalizePath(rawPath, pathDepth)
 
+	var hash uint64
 	switch strat {
 	case fpFull:
-		h.Write(ip16[:])
-		h.Write([]byte(method))
-		h.Write([]byte(normPath))
-		h.Write([]byte(ua))
+		hash = fnv64a(ip16[:], []byte(method), []byte(normPath), []byte(ua))
 	case fpIPPath:
-		h.Write(ip16[:])
-		h.Write([]byte(method))
-		h.Write([]byte(normPath))
+		hash = fnv64a(ip16[:], []byte(method), []byte(normPath))
 	case fpIPOnly:
-		h.Write(ip16[:])
+		hash = fnv64a(ip16[:])
 	case fpPathUA:
-		h.Write([]byte(method))
-		h.Write([]byte(normPath))
-		h.Write([]byte(ua))
+		hash = fnv64a([]byte(method), []byte(normPath), []byte(ua))
 	case fpPathOnly:
-		h.Write([]byte(method))
-		h.Write([]byte(normPath))
+		hash = fnv64a([]byte(method), []byte(normPath))
 	default:
-		// Fallback to full
-		h.Write(ip16[:])
-		h.Write([]byte(method))
-		h.Write([]byte(normPath))
-		h.Write([]byte(ua))
+		hash = fnv64a(ip16[:], []byte(method), []byte(normPath), []byte(ua))
 	}
 
 	var out [8]byte
-	copy(out[:], h.Sum(nil))
+	out[0] = byte(hash)
+	out[1] = byte(hash >> 8)
+	out[2] = byte(hash >> 16)
+	out[3] = byte(hash >> 24)
+	out[4] = byte(hash >> 32)
+	out[5] = byte(hash >> 40)
+	out[6] = byte(hash >> 48)
+	out[7] = byte(hash >> 56)
 	return out
 }
 

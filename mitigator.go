@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -380,16 +381,16 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
-	// 3. Record behavioral profile + update CMS for EPS tracking
-	m.tracker.Record(addr, r.Method, r.URL.Path, r.UserAgent())
+	// 3. Record behavioral profile + compute anomaly score in single lock.
+	// Also update CMS for EPS tracking and EWMA for spike detection.
+	score := m.tracker.RecordAndScore(addr, r.Method, r.URL.Path, r.UserAgent())
 	strat := fingerprintStrategy(m.strategy.Load())
 	fp := computeFingerprint(strat, addr, r.Method, r.URL.Path, r.UserAgent(), m.PathDepth)
 	m.cms.Increment(fp[:])
-	m.stats.Observe(1.0) // observation count for EWMA/spike detection
+	m.stats.Observe(1.0)
 
 	// 4. Behavioral anomaly check — score based on path diversity, not raw volume.
 	// Normal users browsing diverse pages score ~0. Floods hitting one endpoint score ~0.8+.
-	score := m.tracker.Score(addr)
 	if score > m.Threshold {
 		ttl := m.calcTTL(addr)
 		m.jail.Add(addr, ttl, "auto:behavioral", m.infractionCount(addr))
@@ -454,8 +455,13 @@ func (m *DDOSMitigator) setVars(r *http.Request, action string, addr netip.Addr,
 	caddyhttp.SetVar(r.Context(), "ddos_mitigator.ip", addr.String())
 	// NOTE: the variable key is kept as "z_score" for backward compatibility
 	// with existing log templates, but the value is the behavioral anomaly score (0.0-1.0).
-	caddyhttp.SetVar(r.Context(), "ddos_mitigator.z_score", fmt.Sprintf("%.2f", score))
-	caddyhttp.SetVar(r.Context(), "ddos_mitigator.spike_mode", fmt.Sprintf("%t", m.stats.IsSpikeMode()))
+	caddyhttp.SetVar(r.Context(), "ddos_mitigator.z_score", strconv.FormatFloat(score, 'f', 2, 64))
+	// IsSpikeMode is a lock-free atomic.Bool read — no mutex contention.
+	if m.stats.IsSpikeMode() {
+		caddyhttp.SetVar(r.Context(), "ddos_mitigator.spike_mode", "true")
+	} else {
+		caddyhttp.SetVar(r.Context(), "ddos_mitigator.spike_mode", "false")
+	}
 	if fingerprint != "" {
 		caddyhttp.SetVar(r.Context(), "ddos_mitigator.fingerprint", fingerprint)
 	}

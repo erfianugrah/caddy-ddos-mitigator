@@ -4,7 +4,8 @@
 // mean + variance computation, combined with dual-rate EWMA for spike detection.
 //
 // All operations are O(1) time and O(1) memory (three float64 variables for
-// Welford, two for EWMA). Thread-safe via sync.Mutex.
+// Welford, two for EWMA). Thread-safe via sync.Mutex for writes, cached
+// atomic.Bool for read-only IsSpikeMode check in the hot path.
 //
 // References:
 //   - B.P. Welford, "Note on a method for calculating corrected sums of
@@ -15,6 +16,7 @@ package ddosmitigator
 import (
 	"math"
 	"sync"
+	"sync/atomic"
 )
 
 // ─── EWMA Decay Constants ───────────────────────────────────────────
@@ -39,6 +41,10 @@ const (
 
 // adaptiveStats tracks global traffic statistics using Welford's algorithm
 // for numerically stable mean/variance and dual-rate EWMA for spike detection.
+//
+// Write operations (Observe) are protected by a Mutex. Read-only hot-path
+// queries (IsSpikeMode) use a cached atomic.Bool to avoid lock contention —
+// the spike mode flag is updated atomically at the end of each Observe call.
 type adaptiveStats struct {
 	mu sync.Mutex
 
@@ -54,6 +60,9 @@ type adaptiveStats struct {
 
 	// Configurable warmup threshold
 	minObservations int64
+
+	// Cached spike mode — updated atomically by Observe(), read lock-free by IsSpikeMode().
+	spikeMode atomic.Bool
 }
 
 // ─── Constructor ────────────────────────────────────────────────────
@@ -70,9 +79,9 @@ func newAdaptiveStatsWithWarmup(minObs int) *adaptiveStats {
 
 // Observe feeds a new value into both Welford's algorithm and the dual EWMA.
 // Called once per request/event with the current frequency or rate metric.
+// Also updates the cached spike mode flag atomically.
 func (s *adaptiveStats) Observe(x float64) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// Welford's online update
 	s.count++
@@ -90,6 +99,21 @@ func (s *adaptiveStats) Observe(x float64) {
 		s.ewmaFast = ewmaAlphaFast*x + (1-ewmaAlphaFast)*s.ewmaFast
 		s.ewmaSlow = ewmaAlphaSlow*x + (1-ewmaAlphaSlow)*s.ewmaSlow
 	}
+
+	// Update cached spike mode flag while we hold the lock.
+	spike := false
+	if s.ewmaStarted {
+		if s.ewmaSlow < 1.0 {
+			spike = s.ewmaFast > spikeRatio
+		} else {
+			spike = s.ewmaFast > spikeRatio*s.ewmaSlow
+		}
+	}
+
+	s.mu.Unlock()
+
+	// Store atomically — readers never need to acquire the mutex.
+	s.spikeMode.Store(spike)
 }
 
 // ─── Queries ────────────────────────────────────────────────────────
@@ -158,16 +182,9 @@ func (s *adaptiveStats) EWMA() (fast, slow float64) {
 
 // IsSpikeMode returns true when the fast EWMA significantly exceeds the slow
 // EWMA, indicating a sudden traffic surge (potential DDoS).
+//
+// This is a lock-free read of the cached atomic flag updated by Observe().
+// Safe to call from the hot path without contention.
 func (s *adaptiveStats) IsSpikeMode() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.ewmaStarted {
-		return false
-	}
-	// Avoid false positives when baseline is near zero.
-	if s.ewmaSlow < 1.0 {
-		return s.ewmaFast > spikeRatio
-	}
-	return s.ewmaFast > spikeRatio*s.ewmaSlow
+	return s.spikeMode.Load()
 }

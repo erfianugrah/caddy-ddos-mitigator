@@ -18,7 +18,6 @@ package ddosmitigator
 
 import (
 	"container/list"
-	"hash/fnv"
 	"math"
 	"net/netip"
 	"sync"
@@ -188,9 +187,7 @@ func newIPTracker(maxIPs int, ttl time.Duration) *ipTracker {
 
 func (t *ipTracker) shard(ip netip.Addr) *trackerShard {
 	b := ip.As16()
-	h := fnv.New32a()
-	h.Write(b[:])
-	return &t.shards[h.Sum32()%trackerShards]
+	return &t.shards[fnv32a(b[:])%trackerShards]
 }
 
 // Record adds a request observation to the IP's behavioral profile.
@@ -213,6 +210,34 @@ func (t *ipTracker) Record(ip netip.Addr, method, path, ua string) {
 		s.lru.MoveToBack(p.lruElem)
 	}
 	p.record(method, path)
+}
+
+// RecordAndScore records a request and returns the anomaly score in a single
+// lock acquisition. This eliminates the double-lock pattern of Record() + Score()
+// which was a significant contention point under high concurrency.
+func (t *ipTracker) RecordAndScore(ip netip.Addr, method, path, ua string) float64 {
+	s := t.shard(ip)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	p, exists := s.profiles[ip]
+	if !exists {
+		if len(s.profiles) >= s.maxIPs {
+			s.evictOldestLocked()
+		}
+		p = newIPProfile()
+		s.profiles[ip] = p
+		p.lruElem = s.lru.PushBack(&lruEntry{ip: ip})
+	} else {
+		s.lru.MoveToBack(p.lruElem)
+	}
+	p.record(method, path)
+
+	// Compute score under the same lock — no second acquisition needed.
+	if time.Since(time.Unix(0, p.LastSeen)) > t.ttl {
+		return 0
+	}
+	return p.AnomalyScore()
 }
 
 // Profile returns the behavioral profile for an IP, or nil if not tracked.

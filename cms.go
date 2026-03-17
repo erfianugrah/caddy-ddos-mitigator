@@ -11,7 +11,6 @@ package ddosmitigator
 import (
 	"crypto/rand"
 	"encoding/binary"
-	"hash/fnv"
 	"math"
 	"sync/atomic"
 )
@@ -52,15 +51,9 @@ func newCountMinSketch(depth, width int) *countMinSketch {
 // ─── Hash ───────────────────────────────────────────────────────────
 
 // hash computes the column index for the given key in the specified row.
-// Uses FNV-64a seeded by XOR with the per-row seed.
+// Uses inline FNV-1a seeded with the per-row seed — zero allocation.
 func (cms *countMinSketch) hash(row int, key []byte) int {
-	h := fnv.New64a()
-	// Seed by writing the per-row seed as a prefix.
-	var buf [8]byte
-	binary.LittleEndian.PutUint64(buf[:], cms.seeds[row])
-	h.Write(buf[:])
-	h.Write(key)
-	return int(h.Sum64() % uint64(cms.width))
+	return int(fnv64aSeeded(cms.seeds[row], key) % uint64(cms.width))
 }
 
 // ─── Operations ─────────────────────────────────────────────────────
