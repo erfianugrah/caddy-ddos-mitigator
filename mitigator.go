@@ -378,6 +378,18 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	// 2. Jail check — RLock on one of 64 shards
 	if m.jail.IsJailed(addr) || m.cidr.IsPromoted(addr) {
 		m.setVars(r, "blocked", addr, 0, "")
+		// During spike mode, skip access logging for jailed IPs to avoid the
+		// logging bottleneck that dominates CPU under DDoS. Caddy's log pipeline
+		// does synchronous JSON encoding + 3x file writes per request in the
+		// request goroutine — at 50k blocked req/s this is the primary CPU sink.
+		// Use deterministic IP-hash sampling: log 1-in-64 blocked requests for
+		// forensic visibility even during attacks.
+		if m.stats.IsSpikeMode() {
+			b := addr.As16()
+			if fnv32a(b[:])%64 != 0 { // ~1.5% sampling rate
+				caddyhttp.SetVar(r.Context(), caddyhttp.LogSkipVar, true)
+			}
+		}
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
