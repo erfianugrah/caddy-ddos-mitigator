@@ -594,7 +594,16 @@ func (m *DDOSMitigator) runFileSync(ctx context.Context) {
 				// Detect IPs that wafctl explicitly unjailed:
 				// an IP was jailed before sync, is still jailed now (not expired),
 				// but is absent from the file → wafctl removed it.
-				for addr := range beforeSync {
+				//
+				// IMPORTANT: skip entries jailed AFTER the file's updated_at.
+				// These are entries the plugin added since the last file write —
+				// they're absent from the file because we haven't written them yet,
+				// NOT because wafctl removed them.
+				fileUpdatedAt := time.Time{}
+				if fileResult != nil {
+					fileUpdatedAt = fileResult.UpdatedAt
+				}
+				for addr, entry := range beforeSync {
 					if !m.jail.IsJailed(addr) {
 						// Expired naturally between cycles — reset profile.
 						m.tracker.Reset(addr)
@@ -603,12 +612,18 @@ func (m *DDOSMitigator) runFileSync(ctx context.Context) {
 						continue
 					}
 					if fileResult != nil && fileResult.IPs != nil && !fileResult.IPs[addr] {
-						// Still jailed in memory but removed from file by wafctl.
+						// Entry is in memory but not in the file.
+						// If it was jailed AFTER the file was last written, the plugin
+						// added it — not a wafctl unjail. Skip.
+						entryJailedAt := time.Unix(0, entry.JailedAt)
+						if !fileUpdatedAt.IsZero() && entryJailedAt.After(fileUpdatedAt) {
+							continue
+						}
+						// Entry predates the file write — wafctl must have removed it.
 						m.jail.Remove(addr)
 						m.cidr.DecrementPrefix(addr)
 						m.tracker.Reset(addr)
 						// Grace period: prevent immediate re-jail from stale profile data.
-						// 60 seconds gives enough time for the IP to build a new, diverse profile.
 						m.graceUntil.Store(addr, time.Now().Add(60*time.Second).UnixNano())
 						m.logger.Info("unjailed IP removed by wafctl (60s grace period)",
 							zap.String("ip", addr.String()))

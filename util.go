@@ -280,6 +280,7 @@ func readJailFile(path string, j *ipJail) error {
 type jailFileResult struct {
 	IPs       map[netip.Addr]bool // non-expired IPs present in the file
 	Whitelist []string            // CIDR prefixes from the file (may be nil)
+	UpdatedAt time.Time           // file's updated_at timestamp
 	Skipped   int                 // entries that failed to parse
 }
 
@@ -298,9 +299,11 @@ func readJailFileIPs(path string, j *ipJail) (*jailFileResult, error) {
 	}
 
 	now := time.Now()
+	fileUpdatedAt, _ := time.Parse(time.RFC3339, f.UpdatedAt)
 	result := &jailFileResult{
 		IPs:       make(map[netip.Addr]bool, len(f.Entries)),
 		Whitelist: f.Whitelist,
+		UpdatedAt: fileUpdatedAt,
 	}
 	for ipStr, entry := range f.Entries {
 		addr, err := netip.ParseAddr(ipStr)

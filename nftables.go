@@ -259,17 +259,42 @@ func (n *nftReal) syncJailLocked(entries map[netip.Addr]jailEntry, promoted map[
 	now := time.Now().UnixNano()
 	nowTime := time.Now()
 
-	// Rebuild sets from scratch (flush + re-add).
-	// For small jail populations (<100K) this is simpler and safer than
-	// computing diffs. At 100K entries this takes <1ms.
+	// Rebuild sets from scratch: flush in one transaction, add in another.
+	// Interval sets require this two-step approach — flushing and adding
+	// in the same netlink batch can cause EEXIST on overlapping elements
+	// that haven't been flushed from the kernel yet.
 	n.conn.FlushSet(n.setV4)
 	n.conn.FlushSet(n.setV6)
+	if err := n.conn.Flush(); err != nil {
+		return fmt.Errorf("nftables flush sets: %w", err)
+	}
 
 	var v4Elements, v6Elements []nftables.SetElement
 
+	// Build a set of promoted prefixes for containment checks.
+	// Individual IPs that fall within a promoted prefix are skipped
+	// to avoid overlapping intervals (nftables rejects overlaps with EEXIST).
+	activePrefixes := make([]netip.Prefix, 0, len(promoted))
+	for prefix, exp := range promoted {
+		if !nowTime.After(exp) {
+			activePrefixes = append(activePrefixes, prefix)
+		}
+	}
+
 	// Add individually-jailed IPs as /32 or /128 intervals.
+	// Skip IPs already covered by a promoted CIDR prefix.
 	for addr, e := range entries {
 		if now >= e.ExpiresAt {
+			continue
+		}
+		covered := false
+		for _, prefix := range activePrefixes {
+			if prefix.Contains(addr) {
+				covered = true
+				break
+			}
+		}
+		if covered {
 			continue
 		}
 		start, end := ipToInterval(addr)
