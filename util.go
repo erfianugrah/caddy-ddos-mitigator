@@ -205,10 +205,16 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 
 // jailFileFormat is the JSON structure shared between the plugin and wafctl.
 type jailFileFormat struct {
-	Version   int                      `json:"version"`
-	Entries   map[string]jailFileEntry `json:"entries"`
-	Whitelist []string                 `json:"whitelist,omitempty"` // CIDR prefixes, updated by wafctl
-	UpdatedAt string                   `json:"updated_at"`
+	Version          int                             `json:"version"`
+	Entries          map[string]jailFileEntry        `json:"entries"`
+	PromotedPrefixes map[string]jailFilePromotedCIDR `json:"promoted_prefixes,omitempty"`
+	Whitelist        []string                        `json:"whitelist,omitempty"` // CIDR prefixes, updated by wafctl
+	UpdatedAt        string                          `json:"updated_at"`
+}
+
+// jailFilePromotedCIDR is a CIDR prefix promoted by the aggregator.
+type jailFilePromotedCIDR struct {
+	ExpiresAt string `json:"expires_at"`
 }
 
 // jailFileEntry is the per-IP data in the jail file.
@@ -219,11 +225,13 @@ type jailFileEntry struct {
 	JailedAt    string `json:"jailed_at"`
 }
 
-// writeJailFile serializes the jail's non-expired entries to a JSON file.
-// Includes the current whitelist CIDRs so wafctl can read/update them.
-// Uses atomic write to prevent partial reads by wafctl.
-func writeJailFile(path string, j *ipJail, wl *whitelist) error {
+// writeJailFile serializes the jail's non-expired entries and promoted CIDR
+// prefixes to a JSON file. Includes the current whitelist CIDRs so wafctl
+// can read/update them. Uses atomic write to prevent partial reads by wafctl.
+func writeJailFile(path string, j *ipJail, cidr *cidrAggregator, wl *whitelist) error {
 	snap := j.Snapshot()
+	promoted := cidr.PromotedSnapshot()
+
 	f := jailFileFormat{
 		Version:   1,
 		Entries:   make(map[string]jailFileEntry, len(snap)),
@@ -237,6 +245,15 @@ func writeJailFile(path string, j *ipJail, wl *whitelist) error {
 			Infractions: e.InfractionCount,
 			Reason:      e.Reason,
 			JailedAt:    time.Unix(0, e.JailedAt).UTC().Format(time.RFC3339),
+		}
+	}
+
+	if len(promoted) > 0 {
+		f.PromotedPrefixes = make(map[string]jailFilePromotedCIDR, len(promoted))
+		for prefix, exp := range promoted {
+			f.PromotedPrefixes[prefix.String()] = jailFilePromotedCIDR{
+				ExpiresAt: exp.UTC().Format(time.RFC3339),
+			}
 		}
 	}
 

@@ -28,7 +28,7 @@ func (m *mockNft) Setup() error {
 	return m.setupErr
 }
 
-func (m *mockNft) SyncJail(entries map[netip.Addr]jailEntry) error {
+func (m *mockNft) SyncJail(entries map[netip.Addr]jailEntry, promoted map[netip.Prefix]time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.syncCalls++
@@ -59,7 +59,7 @@ func TestNft_NoopWhenDisabled(t *testing.T) {
 	if err := n.Setup(); err != nil {
 		t.Fatal("noop setup should not error")
 	}
-	if err := n.SyncJail(nil); err != nil {
+	if err := n.SyncJail(nil, nil); err != nil {
 		t.Fatal("noop sync should not error")
 	}
 	if err := n.Cleanup(); err != nil {
@@ -92,7 +92,7 @@ func TestNft_MockSetupAndSync(t *testing.T) {
 		},
 	}
 
-	if err := m.SyncJail(entries); err != nil {
+	if err := m.SyncJail(entries, nil); err != nil {
 		t.Fatal(err)
 	}
 	if m.syncCalls != 1 {
@@ -122,7 +122,7 @@ func TestNft_GracefulWhenUnavailable(t *testing.T) {
 		t.Fatal("should not be available")
 	}
 	// Setup/sync/cleanup should still work (noop behavior)
-	if err := m.SyncJail(nil); err != nil {
+	if err := m.SyncJail(nil, nil); err != nil {
 		t.Fatal("sync should not error when unavailable")
 	}
 }
@@ -147,7 +147,7 @@ func TestNft_SyncFiltersExpired(t *testing.T) {
 	// the caller (the sync goroutine) passes jail.Snapshot()
 	// which already excludes expired entries.
 	// Here we just verify the mock receives what it's given.
-	m.SyncJail(entries)
+	m.SyncJail(entries, nil)
 	if m.syncCalls != 1 {
 		t.Fatal("sync should be called once")
 	}
@@ -158,7 +158,7 @@ func TestNft_MultipleSyncs(t *testing.T) {
 	m.Setup()
 
 	for range 10 {
-		m.SyncJail(map[netip.Addr]jailEntry{})
+		m.SyncJail(map[netip.Addr]jailEntry{}, nil)
 	}
 	if m.syncCalls != 10 {
 		t.Fatalf("sync calls: got %d, want 10", m.syncCalls)

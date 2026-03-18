@@ -14,6 +14,7 @@ import (
 	"net/netip"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/mholt/caddy-l4/layer4"
 	"go.uber.org/zap"
 )
@@ -156,10 +157,46 @@ func extractRemoteIP(addr net.Addr) (netip.Addr, bool) {
 	return a.Unmap(), true
 }
 
+// ─── Caddyfile Parsing ──────────────────────────────────────────────
+
+// UnmarshalCaddyfile sets up the L4 handler from Caddyfile tokens.
+// Used within a layer4 listener_wrappers block:
+//
+//	{
+//	    servers {
+//	        listener_wrappers {
+//	            layer4 {
+//	                route {
+//	                    ddos_mitigator {
+//	                        jail_file /data/waf/jail.json
+//	                    }
+//	                }
+//	            }
+//	        }
+//	    }
+//	}
+func (m *DDOSMitigatorL4) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	d.Next() // consume handler name
+
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "jail_file":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			m.JailFile = d.Val()
+		default:
+			return d.Errf("unknown ddos_mitigator L4 directive: %s", d.Val())
+		}
+	}
+	return nil
+}
+
 // ─── Interface Guards ───────────────────────────────────────────────
 
 var (
-	_ caddy.Module       = (*DDOSMitigatorL4)(nil)
-	_ caddy.Provisioner  = (*DDOSMitigatorL4)(nil)
-	_ layer4.NextHandler = (*DDOSMitigatorL4)(nil)
+	_ caddy.Module          = (*DDOSMitigatorL4)(nil)
+	_ caddy.Provisioner     = (*DDOSMitigatorL4)(nil)
+	_ layer4.NextHandler    = (*DDOSMitigatorL4)(nil)
+	_ caddyfile.Unmarshaler = (*DDOSMitigatorL4)(nil)
 )

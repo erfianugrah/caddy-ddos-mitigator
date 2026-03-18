@@ -28,6 +28,7 @@ type cidrAggregator struct {
 	mu          sync.RWMutex
 	promoted    map[netip.Prefix]time.Time // promoted prefixes → expiry
 	counters    map[netip.Prefix]*atomic.Int32
+	dirty       atomic.Bool // set when promoted state changes
 	thresholdV4 int
 	thresholdV6 int
 }
@@ -130,6 +131,7 @@ func (c *cidrAggregator) Check(addr netip.Addr, ttl time.Duration) *netip.Prefix
 
 	if count >= threshold {
 		c.promoted[prefix] = time.Now().Add(ttl)
+		c.dirty.Store(true)
 		return &prefix
 	}
 	return nil
@@ -167,7 +169,26 @@ func (c *cidrAggregator) Sweep() int {
 			removed++
 		}
 	}
+	if removed > 0 {
+		c.dirty.Store(true)
+	}
 	return removed
+}
+
+// PromotedSnapshot returns a copy of all non-expired promoted prefixes with their expiry times.
+// Used by writeJailFile and nftables sync to include promoted CIDRs.
+func (c *cidrAggregator) PromotedSnapshot() map[netip.Prefix]time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	now := time.Now()
+	result := make(map[netip.Prefix]time.Time, len(c.promoted))
+	for prefix, exp := range c.promoted {
+		if now.Before(exp) {
+			result[prefix] = exp
+		}
+	}
+	return result
 }
 
 // Count returns the number of active promoted prefixes.

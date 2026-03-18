@@ -44,8 +44,9 @@ const (
 type nftManager interface {
 	// Setup creates the nftables table, chain, sets, and drop rules.
 	Setup() error
-	// SyncJail updates the nftables sets to match the current jail state.
-	SyncJail(entries map[netip.Addr]jailEntry) error
+	// SyncJail updates the nftables sets to match the current jail state
+	// and promoted CIDR prefixes.
+	SyncJail(entries map[netip.Addr]jailEntry, promoted map[netip.Prefix]time.Time) error
 	// Cleanup removes all nftables resources created by this module.
 	Cleanup() error
 	// Available returns true if nftables is accessible (NET_ADMIN cap present).
@@ -123,21 +124,23 @@ func (n *nftReal) setupLocked() error {
 		Priority: nftables.ChainPriorityRef(-200),
 	})
 
-	// Create IPv4 set
+	// Create IPv4 set with interval mode (supports both /32 IPs and CIDR ranges).
 	n.setV4 = &nftables.Set{
-		Table:   n.table,
-		Name:    nftSetV4Name,
-		KeyType: nftables.TypeIPAddr,
+		Table:    n.table,
+		Name:     nftSetV4Name,
+		KeyType:  nftables.TypeIPAddr,
+		Interval: true,
 	}
 	if err := n.conn.AddSet(n.setV4, nil); err != nil {
 		return fmt.Errorf("create IPv4 set: %w", err)
 	}
 
-	// Create IPv6 set
+	// Create IPv6 set with interval mode.
 	n.setV6 = &nftables.Set{
-		Table:   n.table,
-		Name:    nftSetV6Name,
-		KeyType: nftables.TypeIP6Addr,
+		Table:    n.table,
+		Name:     nftSetV6Name,
+		KeyType:  nftables.TypeIP6Addr,
+		Interval: true,
 	}
 	if err := n.conn.AddSet(n.setV6, nil); err != nil {
 		return fmt.Errorf("create IPv6 set: %w", err)
@@ -202,7 +205,7 @@ func (n *nftReal) setupLocked() error {
 	return nil
 }
 
-func (n *nftReal) SyncJail(entries map[netip.Addr]jailEntry) error {
+func (n *nftReal) SyncJail(entries map[netip.Addr]jailEntry, promoted map[netip.Prefix]time.Time) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -210,7 +213,7 @@ func (n *nftReal) SyncJail(entries map[netip.Addr]jailEntry) error {
 		return nil
 	}
 
-	if err := n.syncJailLocked(entries); err != nil {
+	if err := n.syncJailLocked(entries, promoted); err != nil {
 		n.consecutiveErrors++
 		n.logger.Warn("nftables sync failed, attempting reconnect",
 			zap.Error(err),
@@ -234,7 +237,7 @@ func (n *nftReal) SyncJail(entries map[netip.Addr]jailEntry) error {
 		}
 
 		// Retry sync after successful reconnect.
-		if retryErr := n.syncJailLocked(entries); retryErr != nil {
+		if retryErr := n.syncJailLocked(entries, promoted); retryErr != nil {
 			n.consecutiveErrors++
 			n.logger.Error("nftables sync failed after reconnect",
 				zap.Error(retryErr),
@@ -250,8 +253,11 @@ func (n *nftReal) SyncJail(entries map[netip.Addr]jailEntry) error {
 }
 
 // syncJailLocked performs the actual nftables set sync. Caller must hold n.mu.
-func (n *nftReal) syncJailLocked(entries map[netip.Addr]jailEntry) error {
+// Includes both individually-jailed IPs (as /32 or /128) and promoted CIDR prefixes.
+// Interval sets require [start, end) pairs where end is the first address NOT in the range.
+func (n *nftReal) syncJailLocked(entries map[netip.Addr]jailEntry, promoted map[netip.Prefix]time.Time) error {
 	now := time.Now().UnixNano()
+	nowTime := time.Now()
 
 	// Rebuild sets from scratch (flush + re-add).
 	// For small jail populations (<100K) this is simpler and safer than
@@ -260,20 +266,44 @@ func (n *nftReal) syncJailLocked(entries map[netip.Addr]jailEntry) error {
 	n.conn.FlushSet(n.setV6)
 
 	var v4Elements, v6Elements []nftables.SetElement
+
+	// Add individually-jailed IPs as /32 or /128 intervals.
 	for addr, e := range entries {
 		if now >= e.ExpiresAt {
 			continue
 		}
+		start, end := ipToInterval(addr)
+		if start == nil {
+			continue
+		}
+		elem := []nftables.SetElement{
+			{Key: start},
+			{Key: end, IntervalEnd: true},
+		}
 		if addr.Is4() {
-			ip := addr.As4()
-			v4Elements = append(v4Elements, nftables.SetElement{
-				Key: ip[:],
-			})
+			v4Elements = append(v4Elements, elem...)
 		} else {
-			ip := addr.As16()
-			v6Elements = append(v6Elements, nftables.SetElement{
-				Key: ip[:],
-			})
+			v6Elements = append(v6Elements, elem...)
+		}
+	}
+
+	// Add promoted CIDR prefixes as native interval ranges.
+	for prefix, exp := range promoted {
+		if nowTime.After(exp) {
+			continue
+		}
+		start, end := prefixToInterval(prefix)
+		if start == nil {
+			continue
+		}
+		elem := []nftables.SetElement{
+			{Key: start},
+			{Key: end, IntervalEnd: true},
+		}
+		if prefix.Addr().Is4() {
+			v4Elements = append(v4Elements, elem...)
+		} else {
+			v6Elements = append(v6Elements, elem...)
 		}
 	}
 
@@ -289,6 +319,63 @@ func (n *nftReal) syncJailLocked(entries map[netip.Addr]jailEntry) error {
 	}
 
 	return n.conn.Flush()
+}
+
+// ipToInterval converts a single IP to an nftables interval [IP, IP+1).
+func ipToInterval(addr netip.Addr) (start, end []byte) {
+	if addr.Is4() {
+		ip := addr.As4()
+		next := addr.Next()
+		if !next.IsValid() {
+			return nil, nil
+		}
+		n := next.As4()
+		return ip[:], n[:]
+	}
+	ip := addr.As16()
+	next := addr.Next()
+	if !next.IsValid() {
+		return nil, nil
+	}
+	n := next.As16()
+	return ip[:], n[:]
+}
+
+// prefixToInterval converts a CIDR prefix to an nftables interval [first, last+1).
+// For example, 192.168.1.0/24 → [192.168.1.0, 192.168.2.0).
+func prefixToInterval(prefix netip.Prefix) (start, end []byte) {
+	rng := netip.PrefixFrom(prefix.Masked().Addr(), prefix.Bits())
+	first := rng.Addr()
+
+	// Compute the first address AFTER the prefix range.
+	// For a /24: 256 addresses, so end = first + 256.
+	bits := first.BitLen() - rng.Bits()
+	count := uint64(1) << bits
+
+	if first.Is4() {
+		s := first.As4()
+		// Convert to uint32, add count, convert back.
+		v := uint32(s[0])<<24 | uint32(s[1])<<16 | uint32(s[2])<<8 | uint32(s[3])
+		v += uint32(count)
+		e := [4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}
+		return s[:], e[:]
+	}
+
+	// IPv6: use As16, add count to the lower 64 bits.
+	s := first.As16()
+	lo := uint64(s[8])<<56 | uint64(s[9])<<48 | uint64(s[10])<<40 | uint64(s[11])<<32 |
+		uint64(s[12])<<24 | uint64(s[13])<<16 | uint64(s[14])<<8 | uint64(s[15])
+	lo += count
+	e := s
+	e[8] = byte(lo >> 56)
+	e[9] = byte(lo >> 48)
+	e[10] = byte(lo >> 40)
+	e[11] = byte(lo >> 32)
+	e[12] = byte(lo >> 24)
+	e[13] = byte(lo >> 16)
+	e[14] = byte(lo >> 8)
+	e[15] = byte(lo)
+	return s[:], e[:]
 }
 
 func (n *nftReal) Cleanup() error {
@@ -314,7 +401,9 @@ func (n *nftReal) Cleanup() error {
 
 type nftNoop struct{}
 
-func (nftNoop) Setup() error                                    { return nil }
-func (nftNoop) SyncJail(entries map[netip.Addr]jailEntry) error { return nil }
-func (nftNoop) Cleanup() error                                  { return nil }
-func (nftNoop) Available() bool                                 { return false }
+func (nftNoop) Setup() error { return nil }
+func (nftNoop) SyncJail(entries map[netip.Addr]jailEntry, promoted map[netip.Prefix]time.Time) error {
+	return nil
+}
+func (nftNoop) Cleanup() error  { return nil }
+func (nftNoop) Available() bool { return false }

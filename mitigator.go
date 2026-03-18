@@ -354,7 +354,7 @@ func (m *DDOSMitigator) Cleanup() error {
 	}
 	// Write final jail state
 	if m.JailFile != "" && m.jail != nil {
-		if err := writeJailFile(m.JailFile, m.jail, m.whitelist); err != nil {
+		if err := writeJailFile(m.JailFile, m.jail, m.cidr, m.whitelist); err != nil {
 			m.logger.Error("failed to write jail file on cleanup",
 				zap.String("path", m.JailFile), zap.Error(err))
 		}
@@ -537,9 +537,12 @@ func (m *DDOSMitigator) runSweeper(ctx context.Context) {
 				m.cidr.DecrementPrefix(addr)
 			})
 			if n > 0 {
+				m.jail.dirty.Store(true) // trigger file write for swept entries
 				m.logger.Debug("jail sweep", zap.Int("removed", n),
 					zap.Int64("remaining", m.jail.Count()))
 			}
+			// Also sweep expired CIDR promotions.
+			m.cidr.Sweep()
 		}
 	}
 }
@@ -613,11 +616,19 @@ func (m *DDOSMitigator) runFileSync(ctx context.Context) {
 				}
 
 				// Write current jail state to file (for wafctl to read),
-				// but only if the jail has been modified since the last write.
-				if m.jail.dirty.CompareAndSwap(true, false) {
-					if err := writeJailFile(m.JailFile, m.jail, m.whitelist); err != nil {
+				// but only if the jail or CIDR state has been modified since the last write.
+				jailDirty := m.jail.dirty.CompareAndSwap(true, false)
+				cidrDirty := m.cidr.dirty.CompareAndSwap(true, false)
+				if jailDirty || cidrDirty {
+					if err := writeJailFile(m.JailFile, m.jail, m.cidr, m.whitelist); err != nil {
 						m.logger.Warn("jail file write error", zap.Error(err))
-						m.jail.dirty.Store(true) // restore flag on failure
+						// Restore flags on failure so next tick retries.
+						if jailDirty {
+							m.jail.dirty.Store(true)
+						}
+						if cidrDirty {
+							m.cidr.dirty.Store(true)
+						}
 					}
 				}
 				return nil
@@ -637,14 +648,16 @@ func (m *DDOSMitigator) runNftSync(ctx context.Context) {
 			return
 		case <-ticker.C:
 			snap := m.jail.Snapshot()
-			if err := m.nft.SyncJail(snap); err != nil {
+			promoted := m.cidr.PromotedSnapshot()
+			if err := m.nft.SyncJail(snap, promoted); err != nil {
 				m.logger.Warn("nftables sync error", zap.Error(err))
 			}
 		case <-m.nftNotify:
 			// Immediate sync triggered by jail.Add — closes the window
 			// between L7 jail and kernel-level nftables drop.
 			snap := m.jail.Snapshot()
-			if err := m.nft.SyncJail(snap); err != nil {
+			promoted := m.cidr.PromotedSnapshot()
+			if err := m.nft.SyncJail(snap, promoted); err != nil {
 				m.logger.Warn("nftables immediate sync error", zap.Error(err))
 			}
 		}
