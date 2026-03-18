@@ -39,8 +39,9 @@ import (
 type xdpManager interface {
 	// Setup loads the XDP program and attaches it to the interface.
 	Setup() error
-	// SyncJail updates the BPF jail map to match the current jail state.
-	SyncJail(entries map[netip.Addr]jailEntry) error
+	// SyncJail updates the BPF jail map to match the current jail state
+	// and promoted CIDR prefixes.
+	SyncJail(entries map[netip.Addr]jailEntry, promoted map[netip.Prefix]time.Time) error
 	// Cleanup detaches the XDP program and closes BPF objects.
 	Cleanup() error
 	// Available returns true if BPF capabilities are present.
@@ -124,7 +125,7 @@ func (x *xdpReal) Setup() error {
 	return nil
 }
 
-func (x *xdpReal) SyncJail(entries map[netip.Addr]jailEntry) error {
+func (x *xdpReal) SyncJail(entries map[netip.Addr]jailEntry, promoted map[netip.Prefix]time.Time) error {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 
@@ -169,6 +170,21 @@ func (x *xdpReal) SyncJail(entries map[netip.Addr]jailEntry) error {
 		}
 	}
 
+	// Add promoted CIDR prefixes to the BPF LPM trie.
+	// The LPM trie natively supports prefix lengths — use the actual
+	// prefix bits (e.g., 24 for /24) mapped to v4-in-v6 (96 + bits).
+	nowTime := time.Now()
+	for prefix, exp := range promoted {
+		if nowTime.After(exp) {
+			continue
+		}
+		key := x.prefixToLpmKey(prefix)
+		if err := jailMap.Put(&key, &dummyVal); err != nil {
+			x.logger.Warn("XDP: failed to add promoted prefix",
+				zap.String("prefix", prefix.String()), zap.Error(err))
+		}
+	}
+
 	return nil
 }
 
@@ -185,6 +201,27 @@ func (x *xdpReal) addrToLpmKey(addr netip.Addr) xdpDropLpmKey {
 	} else {
 		a16 := addr.As16()
 		copy(key.Addr[:], a16[:])
+	}
+	return key
+}
+
+// prefixToLpmKey converts a netip.Prefix to a v4-mapped-v6 LPM trie key.
+// IPv4 prefixes are mapped to v4-in-v6 with prefix length offset by 96.
+func (x *xdpReal) prefixToLpmKey(prefix netip.Prefix) xdpDropLpmKey {
+	var key xdpDropLpmKey
+	addr := prefix.Masked().Addr()
+	bits := prefix.Bits()
+
+	if addr.Is4() {
+		a4 := addr.As4()
+		key.Addr[10] = 0xff
+		key.Addr[11] = 0xff
+		copy(key.Addr[12:], a4[:])
+		key.Prefixlen = uint32(96 + bits) // v4-in-v6 offset
+	} else {
+		a16 := addr.As16()
+		copy(key.Addr[:], a16[:])
+		key.Prefixlen = uint32(bits)
 	}
 	return key
 }
@@ -246,8 +283,10 @@ func (x *xdpReal) Cleanup() error {
 
 type xdpNoop struct{}
 
-func (xdpNoop) Setup() error                                    { return nil }
-func (xdpNoop) SyncJail(entries map[netip.Addr]jailEntry) error { return nil }
-func (xdpNoop) Cleanup() error                                  { return nil }
-func (xdpNoop) Available() bool                                 { return false }
-func (xdpNoop) Stats() (uint64, uint64)                         { return 0, 0 }
+func (xdpNoop) Setup() error { return nil }
+func (xdpNoop) SyncJail(entries map[netip.Addr]jailEntry, promoted map[netip.Prefix]time.Time) error {
+	return nil
+}
+func (xdpNoop) Cleanup() error          { return nil }
+func (xdpNoop) Available() bool         { return false }
+func (xdpNoop) Stats() (uint64, uint64) { return 0, 0 }

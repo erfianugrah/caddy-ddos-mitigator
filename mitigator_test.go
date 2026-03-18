@@ -295,25 +295,21 @@ func TestServeHTTP_SetsLogVars(t *testing.T) {
 func TestCalcTTL_ExponentialBackoff(t *testing.T) {
 	m := provisionMitigator(t)
 
-	addr := netip.MustParseAddr("192.0.2.1")
-
-	// First offense: base penalty
-	ttl0 := m.calcTTL(addr)
+	// First offense (infraction 0): base penalty
+	ttl0 := m.calcTTLForInfractions(0)
 	base := time.Duration(m.BasePenalty)
 	if ttl0 < base/2 || ttl0 > base*2 {
 		t.Fatalf("first TTL should be near base (%s): got %s", base, ttl0)
 	}
 
-	// Add to jail with 1 infraction
-	m.jail.Add(addr, 1*time.Hour, "test", 1)
-	ttl1 := m.calcTTL(addr)
-	if ttl1 <= ttl0 {
-		t.Fatalf("second offense TTL (%s) should exceed first (%s)", ttl1, ttl0)
+	// Second offense (infraction 1): should be larger
+	ttl1 := m.calcTTLForInfractions(1)
+	if ttl1 <= base/2 {
+		t.Fatalf("second offense TTL (%s) should exceed base/2 (%s)", ttl1, base/2)
 	}
 
-	// Add with 5 infractions
-	m.jail.Add(addr, 1*time.Hour, "test", 5)
-	ttl5 := m.calcTTL(addr)
+	// Sixth offense (infraction 5): should be much larger
+	ttl5 := m.calcTTLForInfractions(5)
 	if ttl5 <= ttl1 {
 		t.Fatalf("6th offense TTL (%s) should exceed 2nd (%s)", ttl5, ttl1)
 	}
@@ -324,14 +320,38 @@ func TestCalcTTL_CappedAtMax(t *testing.T) {
 		m.MaxPenalty = caddy.Duration(1 * time.Hour)
 	})
 
-	addr := netip.MustParseAddr("192.0.2.1")
-	m.jail.Add(addr, 1*time.Hour, "test", 20) // Very high infraction count
-
-	ttl := m.calcTTL(addr)
+	// Very high infraction count
+	ttl := m.calcTTLForInfractions(20)
 	maxP := time.Duration(m.MaxPenalty)
 	// TTL should not exceed max penalty (plus jitter margin)
 	if ttl > maxP+maxP/2 {
 		t.Fatalf("TTL (%s) should be capped at max penalty (%s) + jitter", ttl, maxP)
+	}
+}
+
+func TestInfractionHistory_PersistsAcrossJailTerms(t *testing.T) {
+	m := provisionMitigator(t)
+	addr := netip.MustParseAddr("192.0.2.1")
+
+	// First jail: infraction 1
+	m.infractions.Record(addr, 1)
+	if got := m.infractionCount(addr); got != 2 {
+		t.Fatalf("after recording 1, infractionCount should be 2, got %d", got)
+	}
+
+	// Simulate unjail — jail entry removed, but history persists
+	m.jail.Add(addr, 1*time.Second, "test", 1)
+	m.jail.Remove(addr)
+
+	// History still has infraction count
+	if got := m.infractionCount(addr); got != 2 {
+		t.Fatalf("after unjail, infractionCount should still be 2, got %d", got)
+	}
+
+	// Record higher infraction
+	m.infractions.Record(addr, 3)
+	if got := m.infractionCount(addr); got != 4 {
+		t.Fatalf("after recording 3, infractionCount should be 4, got %d", got)
 	}
 }
 

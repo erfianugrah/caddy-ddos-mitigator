@@ -27,7 +27,7 @@ func (m *mockXDP) Setup() error {
 	return nil
 }
 
-func (m *mockXDP) SyncJail(entries map[netip.Addr]jailEntry) error {
+func (m *mockXDP) SyncJail(entries map[netip.Addr]jailEntry, promoted map[netip.Prefix]time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.syncCalls++
@@ -60,7 +60,7 @@ func TestXDP_NoopWhenDisabled(t *testing.T) {
 	if err := n.Setup(); err != nil {
 		t.Fatal(err)
 	}
-	if err := n.SyncJail(nil); err != nil {
+	if err := n.SyncJail(nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	p, d := n.Stats()
@@ -87,7 +87,7 @@ func TestXDP_MockSetupAndSync(t *testing.T) {
 		netip.MustParseAddr("2001:db8::1"): {ExpiresAt: time.Now().Add(30 * time.Minute).UnixNano()},
 	}
 
-	if err := m.SyncJail(entries); err != nil {
+	if err := m.SyncJail(entries, nil); err != nil {
 		t.Fatal(err)
 	}
 	if m.syncCalls != 1 {

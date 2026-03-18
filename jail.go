@@ -185,15 +185,97 @@ func (j *ipJail) Snapshot() map[netip.Addr]jailEntry {
 	return result
 }
 
+// ─── Infraction History ─────────────────────────────────────────────
+//
+// Persists infraction counts across jail terms. When an IP is unjailed
+// (manually or by expiry), its infraction count is preserved here so
+// repeat offenders escalate penalties on re-jail. Uses its own 24h TTL.
+
+const infractionHistoryTTL = 24 * time.Hour
+
+type infractionEntry struct {
+	Count    int32
+	LastSeen int64 // unix nano
+}
+
+// infractionHistory is a sharded map of IP → infraction count with TTL.
+type infractionHistory struct {
+	shards [jailShards]infractionShard
+}
+
+type infractionShard struct {
+	mu      sync.RWMutex
+	entries map[netip.Addr]*infractionEntry
+}
+
+func newInfractionHistory() *infractionHistory {
+	h := &infractionHistory{}
+	for i := range h.shards {
+		h.shards[i].entries = make(map[netip.Addr]*infractionEntry)
+	}
+	return h
+}
+
+func (h *infractionHistory) shard(addr netip.Addr) *infractionShard {
+	b := addr.As16()
+	return &h.shards[fnv32a(b[:])%jailShards]
+}
+
+// Record sets the infraction count for an IP (called on jail.Add).
+func (h *infractionHistory) Record(addr netip.Addr, count int32) {
+	s := h.shard(addr)
+	s.mu.Lock()
+	s.entries[addr] = &infractionEntry{
+		Count:    count,
+		LastSeen: time.Now().UnixNano(),
+	}
+	s.mu.Unlock()
+}
+
+// Get returns the infraction count for an IP, or 0 if not found/expired.
+func (h *infractionHistory) Get(addr netip.Addr) int32 {
+	s := h.shard(addr)
+	s.mu.RLock()
+	e, ok := s.entries[addr]
+	s.mu.RUnlock()
+	if !ok {
+		return 0
+	}
+	if time.Since(time.Unix(0, e.LastSeen)) > infractionHistoryTTL {
+		return 0
+	}
+	return e.Count
+}
+
+// Sweep removes expired entries. Called by the background sweeper.
+func (h *infractionHistory) Sweep() int {
+	cutoff := time.Now().Add(-infractionHistoryTTL).UnixNano()
+	total := 0
+	for i := range h.shards {
+		s := &h.shards[i]
+		s.mu.Lock()
+		for addr, e := range s.entries {
+			if e.LastSeen < cutoff {
+				delete(s.entries, addr)
+				total++
+			}
+		}
+		s.mu.Unlock()
+	}
+	return total
+}
+
 // ─── Jail Registry (shared between L7 and L4 modules) ──────────────
 
 // jailRegistry maps jail file paths to shared ipJail instances with reference
 // counting. When an L7 handler provisions with a jail_file, it registers its
 // jail here. The L4 handler looks it up by the same path during its own Provision.
 
-// jailRegistryEntry wraps an ipJail with a reference count.
+// jailRegistryEntry wraps an ipJail and cidrAggregator with a reference count.
+// Both are shared between L7 and L4 handler instances via the jail file path.
 type jailRegistryEntry struct {
 	jail     *ipJail
+	cidr     *cidrAggregator
 	refCount int
 }
 
@@ -224,6 +306,26 @@ func getJail(jailFile string) *ipJail {
 	defer jailRegistryMu.Unlock()
 	if entry, ok := jailRegistry[jailFile]; ok {
 		return entry.jail
+	}
+	return nil
+}
+
+// setCIDR stores the cidrAggregator in the registry for the given jail file path.
+// Called by the L7 handler during Provision so L4 can access it.
+func setCIDR(jailFile string, cidr *cidrAggregator) {
+	jailRegistryMu.Lock()
+	defer jailRegistryMu.Unlock()
+	if entry, ok := jailRegistry[jailFile]; ok {
+		entry.cidr = cidr
+	}
+}
+
+// getCIDR returns the shared cidrAggregator for a jail file path, or nil.
+func getCIDR(jailFile string) *cidrAggregator {
+	jailRegistryMu.Lock()
+	defer jailRegistryMu.Unlock()
+	if entry, ok := jailRegistry[jailFile]; ok {
+		return entry.cidr
 	}
 	return nil
 }

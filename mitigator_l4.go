@@ -34,6 +34,7 @@ type DDOSMitigatorL4 struct {
 	JailFile string `json:"jail_file,omitempty"`
 
 	jail   *ipJail
+	cidr   *cidrAggregator
 	logger *zap.Logger
 }
 
@@ -55,6 +56,7 @@ func (m *DDOSMitigatorL4) Provision(ctx caddy.Context) error {
 	// If no L7 handler is configured, create a standalone jail.
 	if m.JailFile != "" {
 		m.jail = getOrCreateJail(m.JailFile)
+		m.cidr = getCIDR(m.JailFile) // may be nil if L7 hasn't provisioned yet
 
 		// Load entries from disk if the L7 handler hasn't done so already.
 		if m.jail.Count() == 0 {
@@ -89,7 +91,7 @@ func (m *DDOSMitigatorL4) Handle(cx *layer4.Connection, next layer4.Handler) err
 		return next.Handle(cx)
 	}
 
-	if m.jail.IsJailed(addr) {
+	if m.jail.IsJailed(addr) || (m.cidr != nil && m.cidr.IsPromoted(addr)) {
 		m.logger.Debug("L4 dropping jailed connection",
 			zap.String("ip", addr.String()))
 		return forceDropL4(cx)

@@ -113,19 +113,20 @@ type DDOSMitigator struct {
 
 	// --- Internal state ---
 
-	jail       *ipJail
-	cms        *countMinSketch
-	stats      *adaptiveStats
-	tracker    *ipTracker
-	cidr       *cidrAggregator
-	whitelist  *whitelist
-	graceUntil sync.Map // netip.Addr → int64 (unix nano) — unjail grace period
-	nft        nftManager
-	xdp        xdpManager
-	nftNotify  chan struct{} // signaled on jail.Add to trigger immediate nft sync
-	strategy   atomic.Int32  // current fingerprintStrategy
-	logger     *zap.Logger
-	cancel     context.CancelFunc
+	jail        *ipJail
+	infractions *infractionHistory // persists across jail terms (24h TTL)
+	cms         *countMinSketch
+	stats       *adaptiveStats
+	tracker     *ipTracker
+	cidr        *cidrAggregator
+	whitelist   *whitelist
+	graceUntil  sync.Map // netip.Addr → int64 (unix nano) — unjail grace period
+	nft         nftManager
+	xdp         xdpManager
+	nftNotify   chan struct{} // signaled on jail.Add to trigger immediate nft sync
+	strategy    atomic.Int32  // current fingerprintStrategy
+	logger      *zap.Logger
+	cancel      context.CancelFunc
 }
 
 // ─── Caddy Module Interface ─────────────────────────────────────────
@@ -178,6 +179,7 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 	} else {
 		m.jail = newIPJail()
 	}
+	m.infractions = newInfractionHistory()
 	m.cms = newCountMinSketch(m.CMSDepth, m.CMSWidth)
 	m.stats = newAdaptiveStatsWithWarmup(m.WarmupRequests)
 	if m.ProfileTTL == 0 {
@@ -197,6 +199,9 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 	}
 	m.tracker = newIPTracker(m.ProfileMaxIPs, time.Duration(m.ProfileTTL))
 	m.cidr = newCIDRAggregatorWithThresholds(m.CIDRThresholdV4, m.CIDRThresholdV6)
+	if m.JailFile != "" {
+		setCIDR(m.JailFile, m.cidr)
+	}
 	wl, err := newWhitelist(m.WhitelistCIDRs)
 	if err != nil {
 		return fmt.Errorf("whitelist: %w", err)
@@ -416,8 +421,10 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		}
 	}
 	if score > m.Threshold {
-		ttl := m.calcTTL(addr)
-		m.jail.Add(addr, ttl, "auto:behavioral", m.infractionCount(addr))
+		infractions := m.infractionCount(addr)
+		ttl := m.calcTTLForInfractions(infractions)
+		m.jail.Add(addr, ttl, "auto:behavioral", infractions)
+		m.infractions.Record(addr, infractions)
 		m.cidr.IncrementPrefix(addr)
 		// Signal immediate nft sync — don't wait for the next tick interval.
 		// This closes the window between L7 jail and kernel drop from seconds to ~0.
@@ -450,10 +457,8 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 
 // ─── TTL Calculation ────────────────────────────────────────────────
 
-// calcTTL computes the jail duration using exponential backoff with jitter.
-func (m *DDOSMitigator) calcTTL(addr netip.Addr) time.Duration {
-	infractions := m.infractionCount(addr)
-
+// calcTTLForInfractions computes the jail duration using exponential backoff with jitter.
+func (m *DDOSMitigator) calcTTLForInfractions(infractions int32) time.Duration {
 	// Exponential backoff: base * 2^infractions
 	shift := min(infractions, 16) // prevent overflow
 	ttl := time.Duration(m.BasePenalty) << shift
@@ -471,11 +476,13 @@ func (m *DDOSMitigator) calcTTL(addr netip.Addr) time.Duration {
 	return ttl
 }
 
+// infractionCount returns the next infraction count for an IP using the
+// persistent infraction history (survives jail expiry/unjail, 24h TTL).
+// This fixes two bugs: (a) infraction count no longer lost on unjail/expiry,
+// (b) concurrent goroutines don't race on the same jail entry — history is
+// independent and the final count is recorded atomically after jail.Add.
 func (m *DDOSMitigator) infractionCount(addr netip.Addr) int32 {
-	if e := m.jail.Get(addr); e != nil {
-		return e.InfractionCount + 1
-	}
-	return 0
+	return m.infractions.Get(addr) + 1
 }
 
 // ─── Log Variables ──────────────────────────────────────────────────
@@ -543,6 +550,16 @@ func (m *DDOSMitigator) runSweeper(ctx context.Context) {
 			}
 			// Also sweep expired CIDR promotions.
 			m.cidr.Sweep()
+			// Sweep expired infraction history entries (24h TTL).
+			m.infractions.Sweep()
+			// Clean expired grace-until entries to prevent sync.Map leak.
+			now := time.Now().UnixNano()
+			m.graceUntil.Range(func(key, value any) bool {
+				if now >= value.(int64) {
+					m.graceUntil.Delete(key)
+				}
+				return true
+			})
 		}
 	}
 }
@@ -688,7 +705,8 @@ func (m *DDOSMitigator) runXDPSync(ctx context.Context) {
 			return
 		case <-ticker.C:
 			snap := m.jail.Snapshot()
-			if err := m.xdp.SyncJail(snap); err != nil {
+			promoted := m.cidr.PromotedSnapshot()
+			if err := m.xdp.SyncJail(snap, promoted); err != nil {
 				m.logger.Warn("XDP sync error", zap.Error(err))
 			}
 		}

@@ -234,9 +234,8 @@ func (t *ipTracker) RecordAndScore(ip netip.Addr, method, path, ua string) float
 	p.record(method, path)
 
 	// Compute score under the same lock — no second acquisition needed.
-	if time.Since(time.Unix(0, p.LastSeen)) > t.ttl {
-		return 0
-	}
+	// Note: p.record() just set LastSeen = now, so a TTL check here is
+	// always false. Scoring is based on the profile's data, not its age.
 	return p.AnomalyScore()
 }
 

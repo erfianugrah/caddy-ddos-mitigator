@@ -130,7 +130,13 @@ func (c *cidrAggregator) Check(addr netip.Addr, ttl time.Duration) *netip.Prefix
 	}
 
 	if count >= threshold {
-		c.promoted[prefix] = time.Now().Add(ttl)
+		newExp := time.Now().Add(ttl)
+		// Keep the longest TTL — don't downgrade an existing promotion
+		// if this request had a lower infraction count (shorter TTL).
+		if existing, ok := c.promoted[prefix]; ok && existing.After(newExp) {
+			return nil // already promoted with longer TTL
+		}
+		c.promoted[prefix] = newExp
 		c.dirty.Store(true)
 		return &prefix
 	}
