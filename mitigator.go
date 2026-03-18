@@ -122,7 +122,8 @@ type DDOSMitigator struct {
 	graceUntil sync.Map // netip.Addr → int64 (unix nano) — unjail grace period
 	nft        nftManager
 	xdp        xdpManager
-	strategy   atomic.Int32 // current fingerprintStrategy
+	nftNotify  chan struct{} // signaled on jail.Add to trigger immediate nft sync
+	strategy   atomic.Int32  // current fingerprintStrategy
 	logger     *zap.Logger
 	cancel     context.CancelFunc
 }
@@ -268,6 +269,7 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 	// Start background goroutines
 	bgCtx, cancel := context.WithCancel(ctx)
 	m.cancel = cancel
+	m.nftNotify = make(chan struct{}, 1) // buffered: non-blocking signal
 
 	go m.runSweeper(bgCtx)
 	go m.runDecay(bgCtx)
@@ -417,6 +419,12 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		ttl := m.calcTTL(addr)
 		m.jail.Add(addr, ttl, "auto:behavioral", m.infractionCount(addr))
 		m.cidr.IncrementPrefix(addr)
+		// Signal immediate nft sync — don't wait for the next tick interval.
+		// This closes the window between L7 jail and kernel drop from seconds to ~0.
+		select {
+		case m.nftNotify <- struct{}{}:
+		default: // already signaled, skip
+		}
 		m.setVars(r, "jailed", addr, score, fpHex(fp))
 		m.logger.Info("auto-jailed IP (behavioral)",
 			zap.String("ip", addr.String()),
@@ -631,6 +639,13 @@ func (m *DDOSMitigator) runNftSync(ctx context.Context) {
 			snap := m.jail.Snapshot()
 			if err := m.nft.SyncJail(snap); err != nil {
 				m.logger.Warn("nftables sync error", zap.Error(err))
+			}
+		case <-m.nftNotify:
+			// Immediate sync triggered by jail.Add — closes the window
+			// between L7 jail and kernel-level nftables drop.
+			snap := m.jail.Snapshot()
+			if err := m.nft.SyncJail(snap); err != nil {
+				m.logger.Warn("nftables immediate sync error", zap.Error(err))
 			}
 		}
 	}
