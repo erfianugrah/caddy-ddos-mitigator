@@ -270,17 +270,18 @@ go generate ./...
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `mitigator.go` | 810 | L7 handler, Caddy lifecycle, Caddyfile parsing |
-| `nftables.go` | 321 | Kernel ipset management via google/nftables |
-| `profile.go` | 313 | Per-IP behavioral profiling + anomaly scoring |
-| `xdp.go` | 253 | eBPF/XDP loader via cilium/ebpf |
-| `jail.go` | 248 | 64-shard concurrent map, TTL, sweep, registry |
-| `util.go` | 222 | Whitelist, atomicWriteFile, jail file I/O |
-| `stats.go` | 173 | Welford + dual EWMA, spike detection |
-| `mitigator_l4.go` | 163 | L4 TCP RST handler, forceDrop |
-| `cidr.go` | 178 | CIDR prefix aggregation |
-| `cms.go` | 127 | Count-Min Sketch, atomic, decay |
-| `fingerprint.go` | 113 | 5 strategies, path normalization |
+| `mitigator.go` | 918 | L7 handler, Caddy lifecycle, Caddyfile parsing |
+| `nftables.go` | 434 | Kernel ipset management via google/nftables |
+| `jail.go` | 347 | 64-shard concurrent map, TTL, sweep, registry |
+| `util.go` | 338 | Whitelist, atomicWriteFile, jail file I/O |
+| `profile.go` | 337 | Per-IP behavioral profiling + anomaly scoring |
+| `xdp.go` | 292 | eBPF/XDP loader via cilium/ebpf |
+| `cidr.go` | 205 | CIDR prefix aggregation |
+| `mitigator_l4.go` | 204 | L4 TCP RST handler, forceDrop |
+| `stats.go` | 190 | Welford + dual EWMA, spike detection |
+| `xdpdrop_x86_bpfel.go` | 143 | Generated eBPF Go bindings |
+| `cms.go` | 120 | Count-Min Sketch, atomic, decay |
+| `fingerprint.go` | 107 | 5 strategies, path normalization |
 | `bpf/xdp_drop.c` | 106 | XDP eBPF C program |
 
 ## Security
