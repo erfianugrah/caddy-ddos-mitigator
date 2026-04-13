@@ -4,12 +4,25 @@ Adaptive DDoS/DoS mitigation plugin for [Caddy](https://caddyserver.com/). Behav
 
 ## How It Works
 
-The plugin evaluates each request's **behavioral profile** — not just raw volume. A single user browsing 200 pages scores 0.00 (normal). A bot hitting one endpoint 500 times scores 0.85 (flood). This prevents the false positives that pure rate-limiting produces.
+Three-layer detection architecture (v0.17.0+) eliminates false positives from legitimate
+multi-service clients while catching floods:
 
-**Detection signals:**
-- **Path diversity** — unique paths / total requests. Users browse many pages; bots hammer one.
+**Layer 1 — Global rate gate:** Per-IP sustained req/s across ALL services (60s sliding window
+via ring buffer). Catches server-saturating floods regardless of path diversity. Configurable
+threshold; 0 = disabled. Uses `hostTracker.GlobalRecentRate()`.
+
+**Layer 2 — Per-service behavioral profiling:** Tracker keyed on `(IP, host)` so each service
+gets its own profile. Path diversity scoring detects targeted low-rate attacks that don't
+trigger L1. A flood on one service does not inflate another service's score.
+
+**Layer 3 — Host diversity exculpation:** Global per-IP host count. At jail-decision time:
+`effectiveScore = rawScore / log2(uniqueHosts + 1)`. A real user hitting 8 services gets
+3.17× score reduction; a DDoS targeting 1 service gets none.
+
+**Detection signals (L2):**
+- **Path diversity** — unique paths / total requests per (IP, host). Users browse many pages; bots hammer one.
 - **Volume confidence** — low request counts are dampened (not enough data to judge).
-- **Rate amplification** — high req/s with low diversity is more suspicious than slow monotone traffic.
+- **Rate amplification** — high 60s-window req/s with low diversity is more suspicious than slow monotone traffic.
 
 **Enforcement layers (fastest to slowest):**
 
@@ -41,14 +54,18 @@ example.com {
     ddos_mitigator {
         # Core detection
         jail_file         /data/waf/jail.json
-        threshold         0.65          # behavioral anomaly score (0.0–1.0)
+        threshold         0.65          # L2 behavioral anomaly score (0.0–1.0)
         base_penalty      60s           # first offense jail duration
         max_penalty       24h           # cap for exponential backoff
         warmup_requests   1000          # min observations before adaptive stats activate
 
+        # Three-layer detection (v0.17.0+)
+        global_rate_threshold 0         # L1: sustained req/s to jail (0=disabled)
+        min_host_exculpation  2         # L3: unique hosts needed for dampening
+
         # Behavioral profiling
-        profile_ttl       10m           # how long IP profiles are retained
-        profile_max_ips   100000        # max tracked IPs (LRU eviction)
+        profile_ttl       10m           # how long per-(IP,host) profiles are retained
+        profile_max_ips   100000        # max tracked (IP,host) pairs (LRU eviction)
 
         # CIDR aggregation
         cidr_threshold_v4 5             # jail /24 when 5+ IPs from same subnet
@@ -92,6 +109,8 @@ All Caddyfile directives map to JSON fields on the `http.handlers.ddos_mitigator
     "base_penalty": "60s",
     "max_penalty": "24h",
     "warmup_requests": 1000,
+    "global_rate_threshold": 0,
+    "min_host_exculpation": 2,
     "profile_ttl": "10m",
     "profile_max_ips": 100000,
     "cidr_threshold_v4": 5,
@@ -143,12 +162,16 @@ The L4 and L7 modules share the same jail via a package-level registry keyed by 
                    │  eBPF/XDP: BPF map lookup → XDP_DROP            │
                    │  nftables: ipset lookup → kernel drop           │
                    │  L4 handler: jail check → SetLinger(0) + RST    │
-                   │  L7 handler:                                    │
-                   │    ├─ whitelist? → pass                         │
-                   │    ├─ jailed or CIDR promoted? → 403            │
-                   │    ├─ tracker.Record(ip, method, path, ua)      │
-                   │    ├─ profile.AnomalyScore() > threshold? → jail│
-                   │    └─ pass → next handler (WAF, proxy)          │
+                    │  L7 handler:                                    │
+                    │    ├─ whitelist? → pass                         │
+                    │    ├─ jailed or CIDR promoted? → 403            │
+                    │    ├─ hosts.Record(ip, host) → uniqueHosts      │
+                    │    ├─ hosts.GlobalRecentRate(ip) → globalRate    │
+                    │    ├─ L1: globalRate > threshold? → jail (rate)  │
+                    │    ├─ L2: tracker.RecordAndScore(ip, host, ...) │
+                    │    ├─ L3: score / log2(uniqueHosts+1)           │
+                    │    ├─ effectiveScore > threshold? → jail (behav) │
+                    │    └─ pass → next handler (WAF, proxy)          │
                    └─────────────────────────────────────────────────┘
                               │
                    jail.json  │  Caddy log fields
@@ -160,18 +183,19 @@ The L4 and L7 modules share the same jail via a package-level registry keyed by 
 
 ## Behavioral Scoring
 
-The `AnomalyScore()` function computes a 0.0–1.0 score per IP:
+The `AnomalyScore(uniqueHosts, recentRate)` function computes a 0.0–1.0 score per (IP, host):
 
-| Scenario | Path Diversity | Volume | Score |
-|----------|---------------|--------|-------|
-| Normal browsing (16 pages) | 1.00 | 16 | 0.00 |
-| Power user (200 reqs, 20 pages) | 0.10 | 200 | 0.00 |
-| Crawler (100 unique pages) | 1.00 | 100 | 0.00 |
-| Slow flood (50 reqs, 1 page) | 0.02 | 50 | 0.20 |
-| Flood (500 reqs, 1 page) | 0.002 | 500 | 0.85 |
-| Monotone flood (300 reqs, 1 page) | 0.003 | 300 | 0.71 |
+| Scenario | Path Div | Volume | Hosts | Raw Score | Effective |
+|----------|----------|--------|-------|-----------|-----------|
+| Normal browsing (16 pages) | 1.00 | 16 | 1 | 0.00 | 0.00 |
+| Power user (200 reqs, 20 pages) | 0.10 | 200 | 1 | 0.00 | 0.00 |
+| Crawler (100 unique pages) | 1.00 | 100 | 1 | 0.00 | 0.00 |
+| Slow flood (50 reqs, 1 page) | 0.02 | 50 | 1 | 0.20 | 0.20 |
+| Flood (500 reqs, 1 page) | 0.002 | 500 | 1 | 0.85 | 0.85 |
+| Composer SSE (8k reqs, 22 paths) | 0.003 | 8101 | 8 | 1.00 | **0.32** |
+| DDoS targeting 1 service | 0.002 | 500 | 1 | 0.85 | 0.85 |
 
-The scoring uses exponential decay on path diversity (`exp(-pathDiv × 80)`) modulated by volume confidence and rate amplification. All parameters are tuned to ensure normal users never reach the default threshold (0.65) regardless of browsing intensity.
+Scoring uses exponential decay on path diversity (`exp(-pathDiv × 80)`) modulated by volume confidence, rate amplification (60s sliding window), and L3 host diversity dampening (`/ log2(uniqueHosts + 1)`). The Composer SSE scenario shows how a legitimate multi-service client with bot-like per-service patterns is exculpated by L3.
 
 ## Penalty Escalation
 
@@ -208,7 +232,7 @@ log_append ddos_spike_mode   {http.vars.ddos_mitigator.spike_mode}
 
 | Field | Values | Description |
 |-------|--------|-------------|
-| `ddos_action` | `pass`, `blocked`, `jailed` | What the mitigator decided |
+| `ddos_action` | `pass`, `blocked`, `jailed` | What the mitigator decided. Jail reason in jail.json: `auto:rate` (L1) or `auto:behavioral` (L2) |
 | `ddos_fingerprint` | hex string | FNV-64a hash of request signature |
 | `ddos_z_score` | float | Behavioral anomaly score (0.0-1.0, not a statistical z-score; name kept for backward compatibility) |
 | `ddos_spike_mode` | `true`/`false` | Whether EWMA spike detection is active |
@@ -256,7 +280,7 @@ Total hot path (whitelist + jail + profile + CMS): ~90 ns per request with zero 
 ## Testing
 
 ```bash
-# Unit tests (116 tests)
+# Unit tests
 go test -count=1 -timeout 60s ./...
 
 # Benchmarks
@@ -270,11 +294,11 @@ go generate ./...
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `mitigator.go` | 918 | L7 handler, Caddy lifecycle, Caddyfile parsing |
+| `mitigator.go` | 1021 | L7 handler, 3-layer detection, Caddy lifecycle, Caddyfile parsing |
 | `nftables.go` | 434 | Kernel ipset management via google/nftables |
 | `jail.go` | 347 | 64-shard concurrent map, TTL, sweep, registry |
 | `util.go` | 338 | Whitelist, atomicWriteFile, jail file I/O |
-| `profile.go` | 337 | Per-IP behavioral profiling + anomaly scoring |
+| `profile.go` | 688 | Per-(IP,host) profiling, hostTracker (L3), anomaly scoring, ring buffer rate |
 | `xdp.go` | 292 | eBPF/XDP loader via cilium/ebpf |
 | `cidr.go` | 205 | CIDR prefix aggregation |
 | `mitigator_l4.go` | 204 | L4 TCP RST handler, forceDrop |
