@@ -179,20 +179,23 @@ func (p *ipProfile) RecentRate() float64 {
 // A legitimate user hitting 8 services gets a 3.17× score reduction.
 // A DDoS targeting 1 service gets no reduction.
 //
+// recentRate is the 60s sliding-window rate from the global hostTracker ring
+// buffer (all hosts combined). Passed in to avoid a second lock acquisition
+// and to use the accurate per-window rate for the rateBoost signal.
+//
 // The score combines multiple signals:
 // - Low path diversity (flood indicator) — heaviest weight
-// - High request rate with low diversity (amplified flood indicator)
+// - High recent request rate with low diversity (amplified flood indicator)
 // - Low method diversity is a weak signal (most users use mostly GET)
 //
 // A user browsing 50 pages at 2 req/s scores ~0.1.
 // A bot hitting one page at 100 req/s scores ~0.95.
-func (p *ipProfile) AnomalyScore(uniqueHosts int) float64 {
+func (p *ipProfile) AnomalyScore(uniqueHosts int, recentRate float64) float64 {
 	if p.Requests < 5 {
 		return 0 // not enough data
 	}
 
 	pathDiv := p.PathDiversity()
-	rate := p.RequestRate()
 
 	// Path diversity is the primary signal, using an exponential curve.
 	// pathDiv ≥ 0.05 → normal (score ≈ 0), most users browse 5%+ unique paths
@@ -207,10 +210,12 @@ func (p *ipProfile) AnomalyScore(uniqueHosts int) float64 {
 	// Below 10 requests: dampened. Above 30: full confidence.
 	volumeConf := math.Min(float64(p.Requests)/30.0, 1.0)
 
-	// Rate boost: if rate > 5 req/s AND diversity is low, amplify.
+	// Rate boost: uses the 60s sliding-window rate (global across all hosts).
+	// This avoids lifetime-dilution and reflects the actual current burst rate.
+	// Only amplifies when both rate is high AND path diversity is low.
 	rateBoost := 1.0
-	if rate > 5.0 && pathDiv < 0.05 {
-		rateBoost = math.Min(1.0+(rate-5.0)/20.0, 1.5) // up to 50% boost
+	if recentRate > 5.0 && pathDiv < 0.05 {
+		rateBoost = math.Min(1.0+(recentRate-5.0)/20.0, 1.5) // up to 50% boost
 	}
 
 	rawScore := math.Min(pathScore*volumeConf*rateBoost, 1.0)
@@ -301,8 +306,9 @@ func (t *ipTracker) Record(addr netip.Addr, host, method, path, ua string) {
 }
 
 // RecordAndScore records a request and returns the anomaly score in a single
-// lock acquisition. uniqueHosts is passed in from the global host tracker.
-func (t *ipTracker) RecordAndScore(addr netip.Addr, host, method, path, ua string, uniqueHosts int) float64 {
+// lock acquisition. uniqueHosts and recentRate are passed in from the global
+// host tracker — both are already updated before this call.
+func (t *ipTracker) RecordAndScore(addr netip.Addr, host, method, path, ua string, uniqueHosts int, recentRate float64) float64 {
 	key := ipHostKey{addr: addr, host: host}
 	s := t.shard(key)
 	s.mu.Lock()
@@ -320,7 +326,7 @@ func (t *ipTracker) RecordAndScore(addr netip.Addr, host, method, path, ua strin
 		s.lru.MoveToBack(p.lruElem)
 	}
 	p.record(method, path)
-	return p.AnomalyScore(uniqueHosts)
+	return p.AnomalyScore(uniqueHosts, recentRate)
 }
 
 // RecentRate returns the 60s sliding window rate for the given (IP, host) pair.
@@ -354,7 +360,8 @@ func (t *ipTracker) Profile(addr netip.Addr, host string) *ipProfile {
 }
 
 // Score returns the anomaly score for an (IP, host) pair. Returns 0 if not tracked.
-func (t *ipTracker) Score(addr netip.Addr, host string, uniqueHosts int) float64 {
+// recentRate should be from hostTracker.GlobalRecentRate for accurate rateBoost.
+func (t *ipTracker) Score(addr netip.Addr, host string, uniqueHosts int, recentRate float64) float64 {
 	key := ipHostKey{addr: addr, host: host}
 	s := t.shard(key)
 	s.mu.RLock()
@@ -367,7 +374,7 @@ func (t *ipTracker) Score(addr netip.Addr, host string, uniqueHosts int) float64
 	if time.Since(time.Unix(0, p.LastSeen)) > t.ttl {
 		return 0
 	}
-	return p.AnomalyScore(uniqueHosts)
+	return p.AnomalyScore(uniqueHosts, recentRate)
 }
 
 // Reset removes the behavioral profile for an (IP, host) pair.
@@ -448,10 +455,6 @@ func (t *ipTracker) Snapshot() []ProfileSnapshot {
 			if p.LastSeen < cutoff {
 				continue
 			}
-			paths := make([]string, 0, len(p.paths))
-			for path := range p.paths {
-				paths = append(paths, path)
-			}
 			result = append(result, ProfileSnapshot{
 				Addr:         key.addr,
 				Host:         key.host,
@@ -514,6 +517,10 @@ type hostEntry struct {
 	hosts    map[string]struct{}
 	LastSeen int64 // unix nano
 	lruElem  *list.Element
+	// Global rate ring buffer: all requests from this IP across all hosts.
+	// Sized identically to ipProfile.recentTimes for consistency.
+	recentTimes [rateWindowSize]int64
+	recentHead  int
 }
 
 type hostLRUEntry struct {
@@ -542,10 +549,13 @@ func (ht *hostTracker) shard(addr netip.Addr) *hostShard {
 }
 
 // Record records that addr was seen hitting host. Returns the updated unique host count.
+// Also updates the global rate ring buffer (all hosts combined) for L1 rate gate use.
 func (ht *hostTracker) Record(addr netip.Addr, host string) int {
 	s := ht.shard(addr)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	now := time.Now().UnixNano()
 
 	e, exists := s.entries[addr]
 	if !exists {
@@ -561,8 +571,47 @@ func (ht *hostTracker) Record(addr netip.Addr, host string) int {
 		s.lru.MoveToBack(e.lruElem)
 	}
 	e.hosts[host] = struct{}{}
-	e.LastSeen = time.Now().UnixNano()
+	e.LastSeen = now
+	// Write to global rate ring buffer — counts ALL requests from this IP.
+	e.recentTimes[e.recentHead%rateWindowSize] = now
+	e.recentHead++
 	return len(e.hosts)
+}
+
+// GlobalRecentRate returns the global request rate (all hosts combined) for an IP
+// over the last 60s sliding window. Used for the L1 rate gate.
+// Called AFTER Record() so the current request is included in the count.
+func (ht *hostTracker) GlobalRecentRate(addr netip.Addr) float64 {
+	s := ht.shard(addr)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.entries[addr]
+	if !ok {
+		return 0
+	}
+	now := time.Now().UnixNano()
+	cutoff := now - rateWindowNs
+	count := 0
+	oldest := now
+	for _, ts := range e.recentTimes {
+		if ts == 0 {
+			continue
+		}
+		if ts >= cutoff {
+			count++
+			if ts < oldest {
+				oldest = ts
+			}
+		}
+	}
+	if count < 2 {
+		return 0
+	}
+	windowSpan := float64(now-oldest) / 1e9
+	if windowSpan < 0.001 {
+		return 0
+	}
+	return float64(count) / windowSpan
 }
 
 // UniqueHosts returns the number of distinct hosts seen for addr.

@@ -426,10 +426,14 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
-	// 3. Update CMS for EPS tracking and EWMA for spike detection.
-	// Also record the host for L3 host diversity tracking.
+	// 3. Record host + global rate for L3 exculpation and L1 rate gate.
+	// hosts.Record writes the current timestamp to the global rate ring buffer
+	// so GlobalRecentRate() called immediately after includes this request.
 	host := r.Host
 	uniqueHosts := m.hosts.Record(addr, host)
+
+	// Fetch global rate AFTER Record() so the current request is included.
+	globalRate := m.hosts.GlobalRecentRate(addr)
 
 	strat := fingerprintStrategy(m.strategy.Load())
 	fp := computeFingerprint(strat, addr, r.Method, r.URL.Path, r.UserAgent(), m.PathDepth)
@@ -446,45 +450,49 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		}
 	}
 
-	// 4. L1: Global rate gate — sustained req/s above threshold → jail immediately.
-	// Uses 60s sliding window rate (ring buffer) — immune to profile lifetime dilution.
-	// Only applies when GlobalRateThreshold > 0 and IP is not in grace period.
-	if !inGrace && m.GlobalRateThreshold > 0 {
-		recentRate := m.tracker.RecentRate(addr, host)
-		if recentRate > m.GlobalRateThreshold {
-			infractions := m.infractionCount(addr)
-			ttl := m.calcTTLForInfractions(infractions)
-			m.jail.Add(addr, ttl, "auto:rate", infractions)
-			m.infractions.Record(addr, infractions)
-			m.cidr.IncrementPrefix(addr)
-			select {
-			case m.nftNotify <- struct{}{}:
-			default:
-			}
-			m.setVars(r, "jailed", addr, recentRate/m.GlobalRateThreshold, fpHex(fp))
-			m.logger.Info("auto-jailed IP (rate gate)",
-				zap.String("ip", addr.String()),
-				zap.String("host", host),
-				zap.Float64("recent_rate", recentRate),
-				zap.Float64("threshold", m.GlobalRateThreshold),
-				zap.Duration("ttl", ttl))
-			if prefix := m.cidr.Check(addr, ttl); prefix != nil {
-				m.logger.Warn("CIDR prefix promoted",
-					zap.String("prefix", prefix.String()),
-					zap.Duration("ttl", ttl))
-			}
-			return caddyhttp.Error(http.StatusForbidden, nil)
+	// 4. L1: Global rate gate — sustained req/s across ALL services above threshold.
+	// Uses global ring buffer (all hosts combined) so a distributed low-rate flood
+	// across many services is caught even though each per-host rate looks low.
+	// Called after hosts.Record so the current request is in the rate window.
+	if !inGrace && m.GlobalRateThreshold > 0 && globalRate > m.GlobalRateThreshold {
+		infractions := m.infractionCount(addr)
+		ttl := m.calcTTLForInfractions(infractions)
+		m.jail.Add(addr, ttl, "auto:rate", infractions)
+		m.infractions.Record(addr, infractions)
+		m.cidr.IncrementPrefix(addr)
+		select {
+		case m.nftNotify <- struct{}{}:
+		default:
 		}
+		m.setVars(r, "jailed", addr, globalRate/m.GlobalRateThreshold, fpHex(fp))
+		m.logger.Info("auto-jailed IP (rate gate)",
+			zap.String("ip", addr.String()),
+			zap.Float64("global_rate", globalRate),
+			zap.Float64("threshold", m.GlobalRateThreshold),
+			zap.Duration("ttl", ttl))
+		if prefix := m.cidr.Check(addr, ttl); prefix != nil {
+			m.logger.Warn("CIDR prefix promoted",
+				zap.String("prefix", prefix.String()),
+				zap.Duration("ttl", ttl))
+		}
+		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
 	// 5. L2 + L3: Per-(IP, host) behavioral anomaly score with host diversity exculpation.
-	// L3: uniqueHosts < MinHostExculpation → pass raw count (no dampening yet).
+	// L3: uniqueHosts < MinHostExculpation → no dampening (hostsForScore=1).
 	//     uniqueHosts >= MinHostExculpation → AnomalyScore divides by log2(uniqueHosts+1).
-	hostsForScore := uniqueHosts
-	if uniqueHosts < m.MinHostExculpation {
-		hostsForScore = 1 // no dampening below minimum
+	// Guard: MinHostExculpation<=0 treated as 1 (disabled) to prevent always-dampening
+	// when the config field is zero-valued.
+	minHostEx := m.MinHostExculpation
+	if minHostEx <= 0 {
+		minHostEx = 1
 	}
-	score := m.tracker.RecordAndScore(addr, host, r.Method, r.URL.Path, r.UserAgent(), hostsForScore)
+	hostsForScore := uniqueHosts
+	if uniqueHosts < minHostEx {
+		hostsForScore = 1 // no dampening below minimum threshold
+	}
+	// Pass globalRate for rateBoost — uses accurate 60s window, not lifetime average.
+	score := m.tracker.RecordAndScore(addr, host, r.Method, r.URL.Path, r.UserAgent(), hostsForScore, globalRate)
 
 	if inGrace {
 		score = 0

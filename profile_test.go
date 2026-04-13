@@ -41,7 +41,7 @@ func TestIPProfile_NormalBrowsing(t *testing.T) {
 	}
 
 	uniqueHosts := hosts.UniqueHosts(ip)
-	score := profile.AnomalyScore(uniqueHosts)
+	score := profile.AnomalyScore(uniqueHosts, 0.0)
 	t.Logf("Normal browsing: requests=%d pathRatio=%.2f uniqueHosts=%d score=%.2f",
 		profile.Requests, profile.PathDiversity(), uniqueHosts, score)
 
@@ -68,7 +68,7 @@ func TestIPProfile_FloodAttack(t *testing.T) {
 	}
 
 	uniqueHosts := hosts.UniqueHosts(ip)
-	score := profile.AnomalyScore(uniqueHosts)
+	score := profile.AnomalyScore(uniqueHosts, 0.0)
 	t.Logf("Flood attack: requests=%d pathRatio=%.4f uniqueHosts=%d score=%.2f",
 		profile.Requests, profile.PathDiversity(), uniqueHosts, score)
 
@@ -98,7 +98,7 @@ func TestIPProfile_HighVolumeNormal(t *testing.T) {
 
 	profile := tracker.Profile(ip, testHost)
 	uniqueHosts := hosts.UniqueHosts(ip)
-	score := profile.AnomalyScore(uniqueHosts)
+	score := profile.AnomalyScore(uniqueHosts, 0.0)
 	t.Logf("Power user: requests=%d pathRatio=%.2f uniqueHosts=%d score=%.2f",
 		profile.Requests, profile.PathDiversity(), uniqueHosts, score)
 
@@ -122,7 +122,7 @@ func TestIPProfile_SlowFlood(t *testing.T) {
 
 	profile := tracker.Profile(ip, testHost)
 	uniqueHosts := hosts.UniqueHosts(ip)
-	score := profile.AnomalyScore(uniqueHosts)
+	score := profile.AnomalyScore(uniqueHosts, 0.0)
 	t.Logf("Slow flood: requests=%d pathRatio=%.4f methodDiv=%.2f score=%.2f",
 		profile.Requests, profile.PathDiversity(), profile.MethodDiversity(), score)
 
@@ -148,7 +148,7 @@ func TestIPProfile_CrawlerPattern(t *testing.T) {
 
 	profile := tracker.Profile(ip, testHost)
 	uniqueHosts := hosts.UniqueHosts(ip)
-	score := profile.AnomalyScore(uniqueHosts)
+	score := profile.AnomalyScore(uniqueHosts, 0.0)
 	t.Logf("Crawler: requests=%d pathRatio=%.2f uniqueHosts=%d score=%.2f",
 		profile.Requests, profile.PathDiversity(), uniqueHosts, score)
 
@@ -172,7 +172,7 @@ func TestIPProfile_MixedStatusFlood(t *testing.T) {
 
 	profile := tracker.Profile(ip, testHost)
 	uniqueHosts := hosts.UniqueHosts(ip)
-	score := profile.AnomalyScore(uniqueHosts)
+	score := profile.AnomalyScore(uniqueHosts, 0.0)
 
 	// Low path diversity + high volume = high score
 	if score < 0.6 {
@@ -250,10 +250,10 @@ func TestIPProfile_HostDiversityExculpation(t *testing.T) {
 
 	// Score without host dampening (uniqueHosts=1)
 	profile := tracker.Profile(ip, "composer.erfi.io")
-	rawScore := profile.AnomalyScore(1)
+	rawScore := profile.AnomalyScore(1, 0.0)
 
 	// Score with host dampening (actual unique hosts)
-	dampedScore := profile.AnomalyScore(uniqueHosts)
+	dampedScore := profile.AnomalyScore(uniqueHosts, 0.0)
 
 	t.Logf("composer profile: requests=%d uniquePaths=%d rawScore=%.4f dampedScore=%.4f uniqueHosts=%d",
 		profile.Requests, profile.UniquePaths, rawScore, dampedScore, uniqueHosts)
@@ -290,7 +290,7 @@ func TestIPProfile_DDoSNotExculpated(t *testing.T) {
 	}
 
 	profile := tracker.Profile(ip, "composer.erfi.io")
-	score := profile.AnomalyScore(uniqueHosts)
+	score := profile.AnomalyScore(uniqueHosts, 0.0)
 	t.Logf("DDoS 1-host: requests=%d score=%.4f uniqueHosts=%d", profile.Requests, score, uniqueHosts)
 
 	if score < 0.65 {
@@ -325,7 +325,7 @@ func TestIPTracker_PerHostIsolation(t *testing.T) {
 	if profileA == nil {
 		t.Fatal("profile A should exist")
 	}
-	scoreA := profileA.AnomalyScore(1)
+	scoreA := profileA.AnomalyScore(1, 0.0)
 	t.Logf("Host A (flood): requests=%d pathDiv=%.4f score=%.4f", profileA.Requests, profileA.PathDiversity(), scoreA)
 	if scoreA < 0.65 {
 		t.Fatalf("flooded host A should score high, got %.4f", scoreA)
@@ -336,14 +336,14 @@ func TestIPTracker_PerHostIsolation(t *testing.T) {
 	if profileB == nil {
 		t.Fatal("profile B should exist")
 	}
-	scoreB := profileB.AnomalyScore(1)
+	scoreB := profileB.AnomalyScore(1, 0.0)
 	t.Logf("Host B (normal): requests=%d pathDiv=%.4f score=%.4f", profileB.Requests, profileB.PathDiversity(), scoreB)
 	if scoreB > 0.5 {
 		t.Fatalf("normal host B should have low score, got %.4f", scoreB)
 	}
 }
 
-// TestIPProfile_RecentRate verifies the 60s sliding window rate calculation.
+// TestIPProfile_RecentRate verifies the 60s sliding window rate on per-service profile.
 func TestIPProfile_RecentRate(t *testing.T) {
 	tracker := newIPTracker(10000, 5*time.Minute)
 
@@ -362,11 +362,102 @@ func TestIPProfile_RecentRate(t *testing.T) {
 	rate := profile.RecentRate()
 	t.Logf("RecentRate after 30 rapid requests: %.2f req/s", rate)
 
-	// 30 requests in near-zero time — rate should be very high (or 0 if < 2 timestamps)
-	// The ring buffer holds 64 slots, so all 30 fit. Rate depends on actual elapsed time.
-	// Just verify it doesn't panic and returns a non-negative value.
 	if rate < 0 {
 		t.Fatalf("rate must be non-negative, got %.2f", rate)
+	}
+}
+
+// TestHostTracker_GlobalRecentRate verifies the global rate ring buffer across all hosts.
+func TestHostTracker_GlobalRecentRate(t *testing.T) {
+	ht := newHostTracker(1000, 5*time.Minute)
+
+	ip := netip.MustParseAddr("192.0.2.20")
+
+	// No requests yet — rate should be 0
+	if r := ht.GlobalRecentRate(ip); r != 0 {
+		t.Fatalf("expected 0 before any requests, got %.2f", r)
+	}
+
+	// Record 30 requests across 3 different hosts
+	for i := range 10 {
+		_ = i
+		ht.Record(ip, "a.example.com")
+		ht.Record(ip, "b.example.com")
+		ht.Record(ip, "c.example.com")
+	}
+
+	rate := ht.GlobalRecentRate(ip)
+	t.Logf("GlobalRecentRate after 30 rapid requests across 3 hosts: %.2f req/s", rate)
+
+	// 30 requests in near-zero time — rate is high (exact value depends on elapsed)
+	// Just verify it's non-negative and non-zero with enough requests
+	if rate < 0 {
+		t.Fatalf("rate must be non-negative, got %.2f", rate)
+	}
+
+	// Verify that rate is included from all hosts, not just one
+	uniqueHosts := ht.UniqueHosts(ip)
+	if uniqueHosts != 3 {
+		t.Fatalf("expected 3 unique hosts, got %d", uniqueHosts)
+	}
+}
+
+// TestL1RateGate_GlobalVsPerHost verifies L1 uses global rate across all services.
+// Sends requests spread across 10 services over a measurable time window so that
+// GlobalRecentRate() returns a meaningful rate. The key property verified is that
+// GlobalRecentRate counts ALL requests regardless of host, while per-service profiles
+// would only see 1/10th of the traffic.
+func TestL1RateGate_GlobalVsPerHost(t *testing.T) {
+	ht := newHostTracker(1000, 5*time.Minute)
+	tracker := newIPTracker(1000, 5*time.Minute)
+	ip := netip.MustParseAddr("198.51.100.5")
+
+	services := []string{
+		"a.erfi.io", "b.erfi.io", "c.erfi.io", "d.erfi.io", "e.erfi.io",
+	}
+
+	// Send 3 batches with small sleep between them so rate window spans >1ms
+	for batch := range 3 {
+		for _, svc := range services {
+			ht.Record(ip, svc)
+			tracker.Record(ip, svc, "GET", "/flood", "bot/1.0")
+		}
+		if batch < 2 {
+			time.Sleep(10 * time.Millisecond) // ensure measurable time window
+		}
+	}
+
+	globalRate := ht.GlobalRecentRate(ip)
+	uniqueHosts := ht.UniqueHosts(ip)
+
+	t.Logf("Distributed flood: %d services × 3 batches = %d reqs, globalRate=%.2f req/s, uniqueHosts=%d",
+		len(services), len(services)*3, globalRate, uniqueHosts)
+
+	// Global rate should be non-zero with measurable time between batches
+	if globalRate <= 0 {
+		t.Fatalf("global rate should be >0 with %d requests over time, got %.2f", len(services)*3, globalRate)
+	}
+
+	// Per-service profile only sees 3 requests (1/5th of total)
+	// Global rate sees all 15 requests
+	perSvcProfile := tracker.Profile(ip, "a.erfi.io")
+	if perSvcProfile == nil {
+		t.Fatal("per-service profile should exist")
+	}
+	perSvcRate := perSvcProfile.RecentRate()
+
+	t.Logf("Per-service rate for a.erfi.io: %.2f req/s vs global rate: %.2f req/s",
+		perSvcRate, globalRate)
+
+	// Global rate should be meaningfully higher than per-service rate
+	// (all 5 services contribute to global, only 1 to per-service)
+	if globalRate <= perSvcRate && perSvcRate > 0 {
+		t.Errorf("global rate %.2f should exceed per-service rate %.2f", globalRate, perSvcRate)
+	}
+
+	// Unique hosts tracked correctly
+	if uniqueHosts != len(services) {
+		t.Errorf("expected %d unique hosts, got %d", len(services), uniqueHosts)
 	}
 }
 
@@ -480,8 +571,8 @@ func TestIPProfile_ComposerSSEPattern(t *testing.T) {
 	if composerProfile == nil {
 		t.Fatal("composer profile should exist")
 	}
-	rawScore := composerProfile.AnomalyScore(1)
-	dampedScore := composerProfile.AnomalyScore(uniqueHosts)
+	rawScore := composerProfile.AnomalyScore(1, 0.0)
+	dampedScore := composerProfile.AnomalyScore(uniqueHosts, 0.0)
 	t.Logf("Composer: requests=%d uniquePaths=%d pathDiv=%.5f rawScore=%.4f dampedScore=%.4f",
 		composerProfile.Requests, composerProfile.UniquePaths,
 		composerProfile.PathDiversity(), rawScore, dampedScore)
