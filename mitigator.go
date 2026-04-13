@@ -111,6 +111,17 @@ type DDOSMitigator struct {
 	// Default: 0 (no truncation — backward compatible).
 	PathDepth int `json:"path_depth,omitempty"`
 
+	// GlobalRateThreshold is the sustained requests-per-second (60s sliding window)
+	// above which an IP is jailed immediately via the L1 rate gate, regardless of
+	// path diversity. Default: 0 (disabled — L2 behavioral scoring only).
+	// Set to e.g. 50.0 to jail IPs sustaining >50 req/s from a single host.
+	GlobalRateThreshold float64 `json:"global_rate_threshold,omitempty"`
+
+	// MinHostExculpation is the minimum number of unique hosts an IP must hit
+	// before the L3 host diversity dampening kicks in. Default: 2.
+	// At 1 host: no dampening. At MinHostExculpation+: log2 factor applied.
+	MinHostExculpation int `json:"min_host_exculpation,omitempty"`
+
 	// --- Internal state ---
 
 	jail        *ipJail
@@ -118,6 +129,7 @@ type DDOSMitigator struct {
 	cms         *countMinSketch
 	stats       *adaptiveStats
 	tracker     *ipTracker
+	hosts       *hostTracker // global per-IP host diversity tracker (L3)
 	cidr        *cidrAggregator
 	whitelist   *whitelist
 	graceUntil  sync.Map // netip.Addr → int64 (unix nano) — unjail grace period
@@ -198,6 +210,10 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 		m.CIDRThresholdV6 = 5
 	}
 	m.tracker = newIPTracker(m.ProfileMaxIPs, time.Duration(m.ProfileTTL))
+	m.hosts = newHostTracker(m.ProfileMaxIPs, time.Duration(m.ProfileTTL))
+	if m.MinHostExculpation == 0 {
+		m.MinHostExculpation = 2
+	}
 	m.cidr = newCIDRAggregatorWithThresholds(m.CIDRThresholdV4, m.CIDRThresholdV6)
 	if m.JailFile != "" {
 		setCIDR(m.JailFile, m.cidr)
@@ -290,6 +306,8 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 
 	m.logger.Info("ddos_mitigator provisioned",
 		zap.Float64("threshold", m.Threshold),
+		zap.Float64("global_rate_threshold", m.GlobalRateThreshold),
+		zap.Int("min_host_exculpation", m.MinHostExculpation),
 		zap.Duration("base_penalty", time.Duration(m.BasePenalty)),
 		zap.Int("cms_width", m.CMSWidth),
 		zap.Int("cms_depth", m.CMSDepth),
@@ -336,6 +354,12 @@ func (m *DDOSMitigator) Validate() error {
 	}
 	if m.PathDepth < 0 {
 		return fmt.Errorf("path_depth must be non-negative, got %d", m.PathDepth)
+	}
+	if m.GlobalRateThreshold < 0 {
+		return fmt.Errorf("global_rate_threshold must be non-negative, got %f", m.GlobalRateThreshold)
+	}
+	if m.MinHostExculpation < 0 {
+		return fmt.Errorf("min_host_exculpation must be non-negative, got %d", m.MinHostExculpation)
 	}
 	return nil
 }
@@ -402,24 +426,70 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
-	// 3. Record behavioral profile + compute anomaly score in single lock.
-	// Also update CMS for EPS tracking and EWMA for spike detection.
-	score := m.tracker.RecordAndScore(addr, r.Method, r.URL.Path, r.UserAgent())
+	// 3. Update CMS for EPS tracking and EWMA for spike detection.
+	// Also record the host for L3 host diversity tracking.
+	host := r.Host
+	uniqueHosts := m.hosts.Record(addr, host)
+
 	strat := fingerprintStrategy(m.strategy.Load())
 	fp := computeFingerprint(strat, addr, r.Method, r.URL.Path, r.UserAgent(), m.PathDepth)
 	m.cms.Increment(fp[:])
 	m.stats.Observe(1.0)
 
-	// 4. Behavioral anomaly check — score based on path diversity, not raw volume.
-	// Normal users browsing diverse pages score ~0. Floods hitting one endpoint score ~0.8+.
-	// Skip auto-jail during unjail grace period (prevents immediate re-jail after manual unjail).
+	// Check grace period — suppresses scoring after manual unjail.
+	inGrace := false
 	if graceExp, ok := m.graceUntil.Load(addr); ok {
 		if time.Now().UnixNano() < graceExp.(int64) {
-			score = 0 // suppress scoring during grace period
+			inGrace = true
 		} else {
 			m.graceUntil.Delete(addr) // grace expired, clean up
 		}
 	}
+
+	// 4. L1: Global rate gate — sustained req/s above threshold → jail immediately.
+	// Uses 60s sliding window rate (ring buffer) — immune to profile lifetime dilution.
+	// Only applies when GlobalRateThreshold > 0 and IP is not in grace period.
+	if !inGrace && m.GlobalRateThreshold > 0 {
+		recentRate := m.tracker.RecentRate(addr, host)
+		if recentRate > m.GlobalRateThreshold {
+			infractions := m.infractionCount(addr)
+			ttl := m.calcTTLForInfractions(infractions)
+			m.jail.Add(addr, ttl, "auto:rate", infractions)
+			m.infractions.Record(addr, infractions)
+			m.cidr.IncrementPrefix(addr)
+			select {
+			case m.nftNotify <- struct{}{}:
+			default:
+			}
+			m.setVars(r, "jailed", addr, recentRate/m.GlobalRateThreshold, fpHex(fp))
+			m.logger.Info("auto-jailed IP (rate gate)",
+				zap.String("ip", addr.String()),
+				zap.String("host", host),
+				zap.Float64("recent_rate", recentRate),
+				zap.Float64("threshold", m.GlobalRateThreshold),
+				zap.Duration("ttl", ttl))
+			if prefix := m.cidr.Check(addr, ttl); prefix != nil {
+				m.logger.Warn("CIDR prefix promoted",
+					zap.String("prefix", prefix.String()),
+					zap.Duration("ttl", ttl))
+			}
+			return caddyhttp.Error(http.StatusForbidden, nil)
+		}
+	}
+
+	// 5. L2 + L3: Per-(IP, host) behavioral anomaly score with host diversity exculpation.
+	// L3: uniqueHosts < MinHostExculpation → pass raw count (no dampening yet).
+	//     uniqueHosts >= MinHostExculpation → AnomalyScore divides by log2(uniqueHosts+1).
+	hostsForScore := uniqueHosts
+	if uniqueHosts < m.MinHostExculpation {
+		hostsForScore = 1 // no dampening below minimum
+	}
+	score := m.tracker.RecordAndScore(addr, host, r.Method, r.URL.Path, r.UserAgent(), hostsForScore)
+
+	if inGrace {
+		score = 0
+	}
+
 	if score > m.Threshold {
 		infractions := m.infractionCount(addr)
 		ttl := m.calcTTLForInfractions(infractions)
@@ -435,6 +505,8 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		m.setVars(r, "jailed", addr, score, fpHex(fp))
 		m.logger.Info("auto-jailed IP (behavioral)",
 			zap.String("ip", addr.String()),
+			zap.String("host", host),
+			zap.Int("unique_hosts", uniqueHosts),
 			zap.Float64("anomaly_score", score),
 			zap.Float64("threshold", m.Threshold),
 			zap.Duration("ttl", ttl),
@@ -450,7 +522,7 @@ func (m *DDOSMitigator) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		return caddyhttp.Error(http.StatusForbidden, nil)
 	}
 
-	// 5. Pass through
+	// 6. Pass through
 	m.setVars(r, "pass", addr, score, fpHex(fp))
 	return next.ServeHTTP(w, r)
 }
@@ -552,6 +624,9 @@ func (m *DDOSMitigator) runSweeper(ctx context.Context) {
 			m.cidr.Sweep()
 			// Sweep expired infraction history entries (24h TTL).
 			m.infractions.Sweep()
+			// Sweep expired behavioral profiles and host entries.
+			m.tracker.Sweep()
+			m.hosts.Sweep()
 			// Clean expired grace-until entries to prevent sync.Map leak.
 			now := time.Now().UnixNano()
 			m.graceUntil.Range(func(key, value any) bool {
@@ -622,8 +697,9 @@ func (m *DDOSMitigator) runFileSync(ctx context.Context) {
 				}
 				for addr, entry := range beforeSync {
 					if !m.jail.IsJailed(addr) {
-						// Expired naturally between cycles — reset profile.
-						m.tracker.Reset(addr)
+						// Expired naturally between cycles — reset profile and host tracker.
+						m.tracker.ResetAll(addr)
+						m.hosts.Reset(addr)
 						m.logger.Info("cleared behavioral profile for expired IP",
 							zap.String("ip", addr.String()))
 						continue
@@ -639,7 +715,8 @@ func (m *DDOSMitigator) runFileSync(ctx context.Context) {
 						// Entry predates the file write — wafctl must have removed it.
 						m.jail.Remove(addr)
 						m.cidr.DecrementPrefix(addr)
-						m.tracker.Reset(addr)
+						m.tracker.ResetAll(addr)
+						m.hosts.Reset(addr)
 						// Grace period: prevent immediate re-jail from stale profile data.
 						m.graceUntil.Store(addr, time.Now().Add(60*time.Second).UnixNano())
 						m.logger.Info("unjailed IP removed by wafctl (60s grace period)",
@@ -891,6 +968,24 @@ func (m *DDOSMitigator) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Errf("invalid path_depth: %v", err)
 			}
 			m.PathDepth = v
+		case "global_rate_threshold":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			var v float64
+			if _, err := fmt.Sscanf(d.Val(), "%f", &v); err != nil {
+				return d.Errf("invalid global_rate_threshold: %v", err)
+			}
+			m.GlobalRateThreshold = v
+		case "min_host_exculpation":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			var v int
+			if _, err := fmt.Sscanf(d.Val(), "%d", &v); err != nil {
+				return d.Errf("invalid min_host_exculpation: %v", err)
+			}
+			m.MinHostExculpation = v
 		default:
 			return d.Errf("unknown ddos_mitigator directive: %s", d.Val())
 		}
