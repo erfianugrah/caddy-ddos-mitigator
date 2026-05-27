@@ -157,7 +157,11 @@ func (m *DDOSMitigator) Provision(ctx caddy.Context) error {
 
 	// Apply defaults
 	if m.Threshold == 0 {
-		m.Threshold = 0.65 // behavioral anomaly score: 0.0 (normal) to 1.0 (flood)
+		// Behavioral anomaly score threshold: 0.0 (normal) to 1.0 (flood).
+		// Default 0.75 (raised from 0.65 in v0.17.3): the scorer now dampens
+		// low-rate clients and ignores profiles with <20 requests, so a slightly
+		// higher threshold keeps false-positive rate down without missing floods.
+		m.Threshold = 0.75
 	}
 	if m.BasePenalty == 0 {
 		m.BasePenalty = caddy.Duration(60 * time.Second)

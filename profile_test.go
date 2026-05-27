@@ -590,4 +590,78 @@ func TestIPProfile_ComposerSSEPattern(t *testing.T) {
 	t.Logf("PASS: composer not jailed — damped score %.4f < 0.65 threshold", dampedScore)
 }
 
+// TestIPProfile_LowRateDamp_LongPollingClient verifies the lowRateDamp factor:
+// a long-tab dashboard polling one endpoint at sub-5 req/s should NOT be jailed,
+// even after pathDiv collapses toward 0 from sustained activity. This was the
+// canonical false positive: tab open for an hour polling /api/health every 2s
+// accumulates 1800 requests against 1 path → pathScore ≈ 1.0 → was jailed.
+func TestIPProfile_LowRateDamp_LongPollingClient(t *testing.T) {
+	tracker := newIPTracker(10000, 1*time.Hour)
+	ip := netip.MustParseAddr("192.0.2.99")
+
+	// Simulate 1800 requests to one endpoint (1h polling).
+	for range 1800 {
+		tracker.Record(ip, testHost, "GET", "/api/health", "Mozilla/5.0")
+	}
+	profile := tracker.Profile(ip, testHost)
+	if profile == nil {
+		t.Fatal("profile should exist")
+	}
+
+	// With recentRate=0 (lifetime rate uncomputable in tight test loop)
+	// lowRateDamp is disabled — raw score should be high (legacy behaviour).
+	rawScore := profile.AnomalyScore(1, 0.0)
+	if rawScore < 0.7 {
+		t.Errorf("undamped score should be high (legacy path): got %.4f", rawScore)
+	}
+
+	// With realistic polling rate (0.5 req/s = poll every 2s), lowRateDamp
+	// kicks in and pulls score well below the 0.75 default threshold.
+	slowScore := profile.AnomalyScore(1, 0.5)
+	if slowScore >= 0.75 {
+		t.Errorf("slow polling at 0.5 req/s should be dampened below 0.75 threshold, got %.4f", slowScore)
+	}
+	t.Logf("long polling (1800 reqs, 1 path, 0.5 req/s): raw=%.4f damped=%.4f", rawScore, slowScore)
+
+	// A faster polling client (2 req/s) is still in the dampened zone.
+	mediumScore := profile.AnomalyScore(1, 2.0)
+	if mediumScore >= 0.75 {
+		t.Errorf("polling at 2 req/s should still be dampened below 0.75, got %.4f", mediumScore)
+	}
+	t.Logf("polling at 2 req/s: %.4f", mediumScore)
+
+	// At 5+ req/s, dampening turns off — actual flood rate, should jail.
+	fastScore := profile.AnomalyScore(1, 50.0)
+	if fastScore < 0.75 {
+		t.Errorf("true flood at 50 req/s should exceed 0.75 threshold, got %.4f", fastScore)
+	}
+	t.Logf("flood at 50 req/s: %.4f", fastScore)
+}
+
+// TestIPProfile_MinRequests_BurstPageLoad verifies the 20-request floor:
+// a brief burst of same-path fetches (cache-miss favicon, paginated /api/list,
+// image gallery preloader) should not score during the page-load phase.
+func TestIPProfile_MinRequests_BurstPageLoad(t *testing.T) {
+	tracker := newIPTracker(10000, 5*time.Minute)
+	ip := netip.MustParseAddr("192.0.2.50")
+
+	// 19 same-path requests — just below the floor.
+	for range 19 {
+		tracker.Record(ip, testHost, "GET", "/api/list", "Mozilla/5.0")
+	}
+	p := tracker.Profile(ip, testHost)
+	if s := p.AnomalyScore(1, 0.0); s != 0 {
+		t.Errorf("score should be 0 below min-request floor, got %.4f", s)
+	}
+
+	// One more request crosses the floor — score is now defined but should
+	// still be low because of the volume-confidence ramp at 20/60 = 0.33.
+	tracker.Record(ip, testHost, "GET", "/api/list", "Mozilla/5.0")
+	s := p.AnomalyScore(1, 0.0)
+	if s > 0.5 {
+		t.Errorf("20-request single-path burst should not exceed 0.5 (volumeConf dampened), got %.4f", s)
+	}
+	t.Logf("20-request burst score: %.4f (under 0.5 cap)", s)
+}
+
 var _ = fmt.Sprintf // used in crawler/composer tests

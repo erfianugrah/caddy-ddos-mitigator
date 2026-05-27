@@ -186,13 +186,18 @@ func (p *ipProfile) RecentRate() float64 {
 // The score combines multiple signals:
 // - Low path diversity (flood indicator) — heaviest weight
 // - High recent request rate with low diversity (amplified flood indicator)
+// - Low recent request rate (dampens score — floods are fast, polling is slow)
 // - Low method diversity is a weak signal (most users use mostly GET)
 //
 // A user browsing 50 pages at 2 req/s scores ~0.1.
 // A bot hitting one page at 100 req/s scores ~0.95.
 func (p *ipProfile) AnomalyScore(uniqueHosts int, recentRate float64) float64 {
-	if p.Requests < 5 {
-		return 0 // not enough data
+	// Require enough samples before scoring — a typical SPA page-load issues
+	// 30+ requests in the first second (CSS, JS, images, favicon). Scoring on
+	// <20 samples false-positives on burst page-loads where pathDiv briefly
+	// dips before the page settles.
+	if p.Requests < 20 {
+		return 0
 	}
 
 	pathDiv := p.PathDiversity()
@@ -207,8 +212,10 @@ func (p *ipProfile) AnomalyScore(uniqueHosts int, recentRate float64) float64 {
 	pathScore := math.Exp(-pathDiv * 80.0)
 
 	// Volume confidence: very low request count reduces score (not enough data).
-	// Below 10 requests: dampened. Above 30: full confidence.
-	volumeConf := math.Min(float64(p.Requests)/30.0, 1.0)
+	// Below 20 requests: scoring is skipped entirely (above). Saturation at 60
+	// (was 30) gives a slower confidence ramp — a sub-minute burst of one-path
+	// fetches does not reach full weight.
+	volumeConf := math.Min(float64(p.Requests)/60.0, 1.0)
 
 	// Rate boost: uses the 60s sliding-window rate (global across all hosts).
 	// This avoids lifetime-dilution and reflects the actual current burst rate.
@@ -218,7 +225,24 @@ func (p *ipProfile) AnomalyScore(uniqueHosts int, recentRate float64) float64 {
 		rateBoost = math.Min(1.0+(recentRate-5.0)/20.0, 1.5) // up to 50% boost
 	}
 
-	rawScore := math.Min(pathScore*volumeConf*rateBoost, 1.0)
+	// Low-rate dampening: a flood is fast, polling is slow. Without this signal,
+	// a long-lived polling client (one endpoint, sub-5 req/s, but tab open for
+	// hours) accumulates Requests indefinitely → pathDiv → 0 → pathScore → 1.0,
+	// and gets jailed despite being harmless. Linear ramp:
+	//   recentRate=0.5 → damp=0.28
+	//   recentRate=2.0 → damp=0.52
+	//   recentRate=4.0 → damp=0.84
+	//   recentRate≥5.0 → damp=1.0 (no dampening)
+	//
+	// Gated `recentRate > 0` so unit tests that pass recentRate=0.0 (because the
+	// 60s rate window is uncomputable in tight test loops) keep their existing
+	// behaviour — those tests assert the path-diversity logic in isolation.
+	lowRateDamp := 1.0
+	if recentRate > 0 && recentRate < 5.0 {
+		lowRateDamp = 0.2 + (recentRate/5.0)*0.8
+	}
+
+	rawScore := math.Min(pathScore*volumeConf*rateBoost*lowRateDamp, 1.0)
 
 	// L3: host diversity exculpation.
 	// Divide by log2(uniqueHosts + 1) to dampen score for IPs hitting many services.

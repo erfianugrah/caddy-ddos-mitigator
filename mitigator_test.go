@@ -91,8 +91,8 @@ func TestProvision_Defaults(t *testing.T) {
 		t.Fatalf("Provision with defaults: %v", err)
 	}
 
-	if m.Threshold != 0.65 {
-		t.Fatalf("default threshold: got %f, want 0.65", m.Threshold)
+	if m.Threshold != 0.75 {
+		t.Fatalf("default threshold: got %f, want 0.75", m.Threshold)
 	}
 	if m.jail == nil {
 		t.Fatal("jail should be initialized")
